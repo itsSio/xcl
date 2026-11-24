@@ -1288,15 +1288,6 @@ impl<I: Ir> Lower<'_, I> {
         if name == "S_BARRIER" && self.partial[b] {
             return Err("a barrier where some lanes are elsewhere".into());
         }
-        // instructions whose #1426 semantics are known to differ from the HLSL path and the
-        // console (each reported on #1426): left to the fallback until fixed there
-        const DIFFERS_ON_1426: &[&str] = &[
-            // f32 → f16 of a value below the smallest f16 denormal: 0 instead of rounding to it
-            "V_CVT_F16_F32",
-        ];
-        if DIFFERS_ON_1426.contains(&name) {
-            return Err("its #1426 semantics differ from the console's".into());
-        }
         let operand = |input: bool, ty: &str| d.ienc.operands.iter().any(|o| o.input == input && o.output != input && o.ty == ty);
         let mut inputs: Vec<(Var, I::V)> = Vec::new();
         // SGPRs read whole: numbers (EXEC included, which holds a mask here: refused)
