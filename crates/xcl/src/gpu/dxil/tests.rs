@@ -177,3 +177,53 @@ fn blocks_are_written_in_reverse_post_order() {
     let want: Vec<u32> = (0..64).map(|l| ((l as u32) << 2) + 7 + sgpr[l]).collect();
     assert_eq!(&r.raw[..64], &want[..]);
 }
+
+#[test]
+fn f16_default_rounding_is_round_to_nearest_even() {
+    let wave64 = match (runner::wave64_supported(), runner::wave32_supported()) {
+        (Ok(true), _) => true,
+        (_, Ok(true)) => false,
+        (Err(e), _) => return runner::skip_test(&e),
+        _ => return runner::skip_test("neither wave64 nor wave32 support"),
+    };
+    const V: u64 = 256;
+    let mut code = Vec::new();
+    for (n, e, f) in [
+        ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V)][..]),
+        ("V_MUL_F16", "ENC_VOP2", &[("VDST", 11), ("SRC0", V + 1), ("VSRC1", 2)][..]),
+        ("V_PK_MUL_F16", "ENC_VOP3P", &[("VDST", 12), ("SRC0", V + 1), ("SRC1", V + 2), ("OP_SEL_HI", 3)][..]),
+        ("S_ENDPGM", "ENC_SOPP", &[][..]),
+    ] {
+        code.extend(crate::gpu::rdna2::encode(n, e, f, None).unwrap());
+    }
+    let opt = super::kernel::KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 };
+    let dxil = super::kernel::translate(&code, opt).expect("direct DXIL translate");
+
+    let cases: [(f32, u16); 7] = [
+        (f32::from_bits(3075.0f32.to_bits() - 1), 0x6A01),
+        (3075.0, 0x6A02),
+        (f32::from_bits(3075.0f32.to_bits() + 1), 0x6A02),
+        (3081.0, 0x6A04),
+        (-3075.0, 0xEA02),
+        (65520.0, 0x7C00),
+        (f32::from_bits(0x3300_0001), 0x0001),
+    ];
+    let mut st = runner::KernelState::default();
+    st.sgpr[127] = 0;
+    for (lane, &(value, _)) in cases.iter().enumerate() {
+        st.vgpr[lane][0] = value.to_bits();
+    }
+    st.vgpr[0][1] = 0xEA00_6A00;
+    st.vgpr[0][2] = 0x3C01_3C01;
+
+    let r = runner::run(&dxil, &st, &[]).expect("GPU run");
+    let actual: [u16; 7] = std::array::from_fn(|lane| r.vgpr[lane][10] as u16);
+    let expected = cases.map(|(_, bits)| bits);
+    let product = r.vgpr[0][11] as u16;
+    let packed = r.vgpr[0][12];
+    assert_eq!(
+        (actual, product, packed),
+        (expected, 0x6A02, 0xEA02_6A02),
+        "conversion {actual:04x?}, multiplication {product:04x}, packed multiplication {packed:08x}",
+    );
+}

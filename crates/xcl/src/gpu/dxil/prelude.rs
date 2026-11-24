@@ -42,6 +42,16 @@ impl Lw {
         let h = self.s.f32_to_f16(e);
         self.andc(h, 0xFFFF)
     }
+    /// The recompiler's `to_f16_rounded_expr`: round an exact binary32 input in
+    /// the selected RDNA mode (RNE by default, or `VAR_FP16_RM` when `dyn_rm`).
+    pub fn to_f16_rounded(&mut self, e: Value) -> Value {
+        if self.dyn_rm {
+            let rm = self.rd(super::lower::VAR_FP16_RM);
+            self.f32_to_f16_rm(e, rm)
+        } else {
+            self.f32_to_f16_rne(e)
+        }
+    }
     /// `f16_rtz`: binary16 rounded toward zero.
     pub fn f16_rtz(&mut self, f: Value) -> Value {
         let h = self.s.f32_to_f16(f);

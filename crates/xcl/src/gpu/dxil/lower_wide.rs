@@ -61,7 +61,7 @@ impl Lw {
         };
         let fr = |s: &mut Self, e: Value| {
             let e = if clamp { s.un(op::SATURATE, e) } else { e };
-            s.to_f16(e)
+            if name == "v_pk_mul_f16" { s.to_f16_rounded(e) } else { s.to_f16(e) }
         };
         let dot: Option<Value> = match name {
             "v_dot2_f32_f16" | "v_dot2c_f32_f16" => {
@@ -408,7 +408,7 @@ impl Lw {
             if m.clamp {
                 v = s.un(op::SATURATE, v);
             }
-            s.to_f16(v)
+            if name == "v_mul_f16" { s.to_f16_rounded(v) } else { s.to_f16(v) }
         };
         let dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
         let cur = match &dst {

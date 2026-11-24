@@ -6800,7 +6800,7 @@ fn gpu_f16_defaults_to_round_to_nearest_even() {
     let opt = Options { wave64: false, hw_wave: 32, ..Options::default() };
     let t = translate(&code, &opt).unwrap();
     assert!(t.complete(), "{:?}", t.unsupported_why);
-    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let dxil = direct_or(&code, &opt, super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap());
 
     let cases: [(f32, u16); 7] = [
         (f32::from_bits(3075.0f32.to_bits() - 1), 0x6A01),
