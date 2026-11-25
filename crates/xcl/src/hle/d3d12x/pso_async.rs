@@ -57,6 +57,13 @@ pub(super) fn build_is_wanted() -> bool {
     BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.demand.lock().unwrap().wanted))
 }
 
+/// Whether a driver compile on this thread is wanted by the title (`real::big_compile_turn`):
+/// any compile on a title's own thread (outside a worker `build`) is wanted, while a worker's
+/// build is wanted once a bind waits for it.
+pub(super) fn wanted_compile() -> bool {
+    !building_here() || build_is_wanted()
+}
+
 /// Whether one of the title's threads waits for what this thread is doing, to be asked later and
 /// from another thread: a worker's build as `build_is_wanted`; a thread that is not XCL's is the
 /// title's own.
@@ -777,6 +784,28 @@ mod used_tests {
         started.recv().unwrap();
         assert!(!build_is_wanted(), "this thread builds nothing");
         assert_eq!(resolve_wait_for(standin, None), 0x5353, "the bind's wait reached the build");
+        let _ = released(standin);
+    }
+
+    /// A title thread's own compile is always wanted (`wanted_compile` = true); a worker's
+    /// build starts unwanted and becomes wanted once a bind waits for it.
+    #[test]
+    fn title_threads_always_report_wanted_compile_while_workers_follow_demand() {
+        assert!(!building_here() && wanted_compile(), "unnamed title thread is wanted");
+        let standin = 0x7E57_B006usize;
+        let (started_tx, started) = mpsc::channel();
+        submit(standin, true, Box::new(move || {
+            let unwanted_first = building_here() && !wanted_compile();
+            started_tx.send(()).unwrap();
+            let t = std::time::Instant::now();
+            while !wanted_compile() && t.elapsed() < std::time::Duration::from_secs(10) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            if unwanted_first && wanted_compile() { 0x5656 } else { 0 }
+        }));
+        started.recv().unwrap();
+        assert!(wanted_compile(), "title thread remains wanted while worker runs");
+        assert_eq!(resolve_wait_for(standin, None), 0x5656);
         let _ = released(standin);
     }
 
