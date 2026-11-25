@@ -1116,16 +1116,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
             }
             p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
             if comp.record(&p.dev, &p.list, &bb, w, h, fmt, &resolved, p.ring.cur) {
-                if due {
-                    p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-                    let bb_desc = bb.GetDesc();
-                    if let Some((buffer, footprint)) = readback_copy(&p.list, &bb, &bb_desc) {
-                        dumps.push(FrameDump { _source: bb.clone(), buffer, footprint, format: bb_desc.Format, tag: "frame".into() });
-                    }
-                    p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT)]);
-                } else {
-                    p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT)]);
-                }
+                finish_backbuffer_dump(&p.list, &bb, D3D12_RESOURCE_STATE_RENDER_TARGET, due, &mut dumps);
                 composited = true;
             } else {
                 p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT)]);
@@ -1139,35 +1130,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
     }
     if !composited {
         let (src, desc, _) = &resolved[0];
-        let b1 = [transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)];
-        p.list.ResourceBarrier(&b1);
-        if desc.Width as u32 == p.w && desc.Height == p.h {
-            p.list.CopyResource(&bb, src);
-        } else if desc.Width > 0 && desc.Height > 0 && p.w > 0 && p.h > 0 {
-            let cw = (desc.Width as u32).min(p.w);
-            let ch = desc.Height.min(p.h);
-            let dst = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: ManuallyDrop::new(Some(bb.clone())),
-                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
-            };
-            let src_loc = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: ManuallyDrop::new(Some(src.clone())),
-                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
-            };
-            let box_ = D3D12_BOX { left: 0, top: 0, front: 0, right: cw, bottom: ch, back: 1 };
-            p.list.CopyTextureRegion(&dst, 0, 0, 0, &src_loc, Some(&box_));
-            let _ = ManuallyDrop::into_inner(dst.pResource);
-            let _ = ManuallyDrop::into_inner(src_loc.pResource);
-        }
-        if due {
-            if let Some((buffer, footprint)) = readback_copy(&p.list, src, desc) {
-                dumps.push(FrameDump { _source: src.clone(), buffer, footprint, format: desc.Format, tag: "frame".into() });
-            }
-        }
-        let b2 = [transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)];
-        p.list.ResourceBarrier(&b2);
+        present_single_plane(&p.list, &bb, p.w, p.h, src, desc, due, &mut dumps);
     }
     // with `XCL_TRACE_FRAME`: also the render target the title binds most (its scene / UI)
     // (and the targets the watched one's contents went on to: rt_<n>_<k>)
@@ -1276,8 +1239,131 @@ pub fn last_frame_dump() -> Option<FrameDumpSample> {
     LAST_FRAME_DUMP.lock().ok().and_then(|s| *s)
 }
 
+unsafe fn finish_backbuffer_dump(
+    list: &ID3D12GraphicsCommandList,
+    bb: &ID3D12Resource,
+    state_before: D3D12_RESOURCE_STATES,
+    due: bool,
+    dumps: &mut Vec<FrameDump>,
+) {
+    if due {
+        list.ResourceBarrier(&[transition(bb, state_before, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+        let bb_desc = bb.GetDesc();
+        if let Some((buffer, footprint)) = readback_copy(list, bb, &bb_desc) {
+            dumps.push(FrameDump { _source: bb.clone(), buffer, footprint, format: bb_desc.Format, tag: "frame".into() });
+        }
+        list.ResourceBarrier(&[transition(bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT)]);
+    } else {
+        list.ResourceBarrier(&[transition(bb, state_before, D3D12_RESOURCE_STATE_PRESENT)]);
+    }
+}
+
+unsafe fn present_single_plane(
+    list: &ID3D12GraphicsCommandList,
+    bb: &ID3D12Resource,
+    bb_w: u32,
+    bb_h: u32,
+    src: &ID3D12Resource,
+    desc: &D3D12_RESOURCE_DESC,
+    due: bool,
+    dumps: &mut Vec<FrameDump>,
+) {
+    list.ResourceBarrier(&[transition(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)]);
+    if desc.Width as u32 == bb_w && desc.Height == bb_h {
+        list.CopyResource(bb, src);
+    } else if desc.Width > 0 && desc.Height > 0 && bb_w > 0 && bb_h > 0 {
+        let cw = (desc.Width as u32).min(bb_w);
+        let ch = desc.Height.min(bb_h);
+        let dst = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: ManuallyDrop::new(Some(bb.clone())),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        };
+        let src_loc = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: ManuallyDrop::new(Some(src.clone())),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        };
+        let box_ = D3D12_BOX { left: 0, top: 0, front: 0, right: cw, bottom: ch, back: 1 };
+        list.CopyTextureRegion(&dst, 0, 0, 0, &src_loc, Some(&box_));
+        let _ = ManuallyDrop::into_inner(dst.pResource);
+        let _ = ManuallyDrop::into_inner(src_loc.pResource);
+    }
+    finish_backbuffer_dump(list, bb, D3D12_RESOURCE_STATE_COPY_DEST, due, dumps);
+}
+
+fn is_typeless_format(f: DXGI_FORMAT) -> bool {
+    matches!(
+        f,
+        DXGI_FORMAT_R32G32B32A32_TYPELESS
+            | DXGI_FORMAT_R32G32B32_TYPELESS
+            | DXGI_FORMAT_R16G16B16A16_TYPELESS
+            | DXGI_FORMAT_R32G32_TYPELESS
+            | DXGI_FORMAT_R32G8X24_TYPELESS
+            | DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS
+            | DXGI_FORMAT_X32_TYPELESS_G8X24_UINT
+            | DXGI_FORMAT_R10G10B10A2_TYPELESS
+            | DXGI_FORMAT_R8G8B8A8_TYPELESS
+            | DXGI_FORMAT_R16G16_TYPELESS
+            | DXGI_FORMAT_R32_TYPELESS
+            | DXGI_FORMAT_R24G8_TYPELESS
+            | DXGI_FORMAT_R24_UNORM_X8_TYPELESS
+            | DXGI_FORMAT_X24_TYPELESS_G8_UINT
+            | DXGI_FORMAT_R8G8_TYPELESS
+            | DXGI_FORMAT_R16_TYPELESS
+            | DXGI_FORMAT_R8_TYPELESS
+            | DXGI_FORMAT_BC1_TYPELESS
+            | DXGI_FORMAT_BC2_TYPELESS
+            | DXGI_FORMAT_BC3_TYPELESS
+            | DXGI_FORMAT_BC4_TYPELESS
+            | DXGI_FORMAT_BC5_TYPELESS
+            | DXGI_FORMAT_B8G8R8A8_TYPELESS
+            | DXGI_FORMAT_B8G8R8X8_TYPELESS
+            | DXGI_FORMAT_BC6H_TYPELESS
+            | DXGI_FORMAT_BC7_TYPELESS
+    )
+}
+
+fn validate_readback_desc(desc: &D3D12_RESOURCE_DESC) -> Option<&'static str> {
+    if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+        return Some("non-2D resource");
+    }
+    if desc.SampleDesc.Count != 1 {
+        return Some("multisampled resource");
+    }
+    if desc.Width == 0 || desc.Height == 0 {
+        return Some("zero-sized resource");
+    }
+    if desc.Format == DXGI_FORMAT_UNKNOWN {
+        return Some("unknown format");
+    }
+    if is_typeless_format(desc.Format) {
+        return Some("typeless format");
+    }
+    None
+}
+
+fn valid_readback_footprint(fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT, total: u64) -> bool {
+    total > 0
+        && total != u64::MAX
+        && fp.Footprint.Format != DXGI_FORMAT_UNKNOWN
+        && fp.Footprint.Width > 0
+        && fp.Footprint.Height > 0
+        && fp.Footprint.RowPitch > 0
+}
+
 /// a copy of subresource 0 of `src` into a new readback buffer, recorded on `list`
 unsafe fn readback_copy(list: &ID3D12GraphicsCommandList, src: &ID3D12Resource, desc: &D3D12_RESOURCE_DESC) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
+    if let Some(reason) = validate_readback_desc(desc) {
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            crate::xlog_warn!(
+                "present: skipping readback_copy ({reason}: dim={} {}x{} fmt={} samples={})",
+                desc.Dimension.0, desc.Width, desc.Height, desc.Format.0, desc.SampleDesc.Count
+            );
+        }
+        return None;
+    }
     let dev: ID3D12Device = {
         let mut d: Option<ID3D12Device> = None;
         src.GetDevice(&mut d).ok()?;
@@ -1286,6 +1372,16 @@ unsafe fn readback_copy(list: &ID3D12GraphicsCommandList, src: &ID3D12Resource, 
     let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
     let mut total = 0u64;
     dev.GetCopyableFootprints(desc, 0, 1, 0, Some(&mut fp), None, None, Some(&mut total));
+    if !valid_readback_footprint(&fp, total) {
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            crate::xlog_warn!(
+                "present: skipping readback_copy (invalid footprint: total={total} {}x{} pitch={} fmt={})",
+                fp.Footprint.Width, fp.Footprint.Height, fp.Footprint.RowPitch, fp.Footprint.Format.0
+            );
+        }
+        return None;
+    }
     let mut rb: Option<ID3D12Resource> = None;
     dev.CreateCommittedResource(
         &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
@@ -1824,6 +1920,135 @@ mod frame_dump_tests {
             let blend = px(1, 2);
             assert!(blend[0] <= 2 && (126..=130).contains(&blend[1]) && (125..=129).contains(&blend[2]) && blend[3] == 255, "unexpected blend {blend:?}");
             rb.Unmap(0, None);
+        }
+    }
+
+    fn test_tex_desc(w: u32, h: u32, fmt: DXGI_FORMAT, samples: u32, flags: D3D12_RESOURCE_FLAGS) -> D3D12_RESOURCE_DESC {
+        D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: w as u64,
+            Height: h,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: fmt,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: samples, Quality: 0 },
+            Flags: flags,
+            ..Default::default()
+        }
+    }
+
+    fn test_buf_desc(w: u64) -> D3D12_RESOURCE_DESC {
+        D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: w,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn readback_copy_rejects_unsupported_descs_and_footprints() {
+        let valid = test_tex_desc(64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, 1, D3D12_RESOURCE_FLAG_NONE);
+        assert_eq!(validate_readback_desc(&valid), None);
+        assert_eq!(validate_readback_desc(&test_buf_desc(256)), Some("non-2D resource"));
+        assert_eq!(validate_readback_desc(&D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE3D, ..valid }), Some("non-2D resource"));
+        assert_eq!(validate_readback_desc(&test_tex_desc(64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, 4, D3D12_RESOURCE_FLAG_NONE)), Some("multisampled resource"));
+        assert_eq!(validate_readback_desc(&test_tex_desc(0, 64, DXGI_FORMAT_R8G8B8A8_UNORM, 1, D3D12_RESOURCE_FLAG_NONE)), Some("zero-sized resource"));
+        assert_eq!(validate_readback_desc(&test_tex_desc(64, 0, DXGI_FORMAT_R8G8B8A8_UNORM, 1, D3D12_RESOURCE_FLAG_NONE)), Some("zero-sized resource"));
+        assert_eq!(validate_readback_desc(&test_tex_desc(64, 64, DXGI_FORMAT_UNKNOWN, 1, D3D12_RESOURCE_FLAG_NONE)), Some("unknown format"));
+        for fmt in [DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_B8G8R8A8_TYPELESS, DXGI_FORMAT_R10G10B10A2_TYPELESS, DXGI_FORMAT_R16G16B16A16_TYPELESS] {
+            assert_eq!(validate_readback_desc(&test_tex_desc(64, 64, fmt, 1, D3D12_RESOURCE_FLAG_NONE)), Some("typeless format"));
+        }
+        let good = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Offset: 0,
+            Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: DXGI_FORMAT_R8G8B8A8_UNORM, Width: 64, Height: 64, Depth: 1, RowPitch: 256 },
+        };
+        assert!(valid_readback_footprint(&good, 256 * 64));
+        assert!(!valid_readback_footprint(&good, 0));
+        assert!(!valid_readback_footprint(&good, u64::MAX));
+        assert!(!valid_readback_footprint(&D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Footprint: D3D12_SUBRESOURCE_FOOTPRINT { RowPitch: 0, ..good.Footprint }, ..good }, 256 * 64));
+        assert!(!valid_readback_footprint(&D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Width: 0, ..good.Footprint }, ..good }, 256 * 64));
+        assert!(!valid_readback_footprint(&D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Height: 0, ..good.Footprint }, ..good }, 256 * 64));
+    }
+
+    #[test]
+    fn readback_copy_guards_and_single_plane_dump_on_d3d12() {
+        unsafe {
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+                return crate::gpu::recomp::runner::skip_test("no DXGI factory");
+            };
+            let Ok(adapter) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
+                return crate::gpu::recomp::runner::skip_test("no WARP");
+            };
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                return crate::gpu::recomp::runner::skip_test("no D3D12 device");
+            }
+            let dev = dev.unwrap();
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let make_res = |heap: D3D12_HEAP_TYPE, desc: &D3D12_RESOURCE_DESC, state: D3D12_RESOURCE_STATES| -> ID3D12Resource {
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() }, D3D12_HEAP_FLAG_NONE, desc, state, None, &mut r).unwrap();
+                r.unwrap()
+            };
+
+            let buf = make_res(D3D12_HEAP_TYPE_DEFAULT, &test_buf_desc(256), D3D12_RESOURCE_STATE_COMMON);
+            let msaa = make_res(D3D12_HEAP_TYPE_DEFAULT, &test_tex_desc(4, 4, DXGI_FORMAT_R8G8B8A8_UNORM, 4, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET), D3D12_RESOURCE_STATE_COMMON);
+            let src = make_res(D3D12_HEAP_TYPE_DEFAULT, &test_tex_desc(4, 4, DXGI_FORMAT_R8G8B8A8_TYPELESS, 1, D3D12_RESOURCE_FLAG_NONE), D3D12_RESOURCE_STATE_COMMON);
+            let bb = make_res(D3D12_HEAP_TYPE_DEFAULT, &test_tex_desc(4, 4, DXGI_FORMAT_R8G8B8A8_UNORM, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET), D3D12_RESOURCE_STATE_COMMON);
+            assert!(readback_copy(&list, &buf, &buf.GetDesc()).is_none());
+            assert!(readback_copy(&list, &msaa, &msaa.GetDesc()).is_none());
+            assert!(readback_copy(&list, &src, &src.GetDesc()).is_none());
+
+            let pitch = 256u32;
+            let up = make_res(D3D12_HEAP_TYPE_UPLOAD, &test_buf_desc((pitch * 4) as u64), D3D12_RESOURCE_STATE_GENERIC_READ);
+            let mut ptr: *mut c_void = std::ptr::null_mut();
+            up.Map(0, None, Some(&mut ptr)).unwrap();
+            let bytes = std::slice::from_raw_parts_mut(ptr as *mut u8, (pitch * 4) as usize);
+            for y in 0..4 {
+                for x in 0..4 {
+                    bytes[(y * pitch + x * 4) as usize..(y * pitch + x * 4 + 4) as usize].copy_from_slice(&[12, 34, 56, 255]);
+                }
+            }
+            up.Unmap(0, None);
+            let dst_loc = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&src), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+            let src_loc = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&up),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: 0, Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: DXGI_FORMAT_R8G8B8A8_UNORM, Width: 4, Height: 4, Depth: 1, RowPitch: pitch } } },
+            };
+            list.ResourceBarrier(&[transition(&src, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+            list.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, None);
+            list.ResourceBarrier(&[transition(&src, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
+
+            let src_desc = src.GetDesc();
+            let mut dumps = Vec::new();
+            present_single_plane(&list, &bb, 4, 4, &src, &src_desc, false, &mut dumps);
+            assert!(dumps.is_empty());
+            present_single_plane(&list, &bb, 4, 4, &src, &src_desc, true, &mut dumps);
+            assert_eq!(dumps.len(), 1);
+            assert_eq!(dumps[0]._source.as_raw(), bb.as_raw(), "must read back swapchain bb, not typeless src");
+            assert_eq!(dumps[0].format, DXGI_FORMAT_R8G8B8A8_UNORM);
+            assert_eq!(dumps[0].tag, "frame");
+            list.Close().unwrap();
+
+            let cl: ID3D12CommandList = list.cast().unwrap();
+            queue.ExecuteCommandLists(&[Some(cl)]);
+            queue.Signal(&fence, 1).unwrap();
+            fence::wait(&fence, 1, &dev, None, 5000).unwrap();
+
+            let mut rb_ptr: *mut c_void = std::ptr::null_mut();
+            dumps[0].buffer.Map(0, None, Some(&mut rb_ptr)).unwrap();
+            let off = dumps[0].footprint.Offset as usize + 2 * dumps[0].footprint.Footprint.RowPitch as usize + 4;
+            assert_eq!(std::slice::from_raw_parts((rb_ptr as *const u8).add(off), 4), &[12, 34, 56, 255]);
+            dumps[0].buffer.Unmap(0, None);
         }
     }
 }
