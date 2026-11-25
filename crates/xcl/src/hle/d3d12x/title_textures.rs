@@ -20,7 +20,7 @@
 //! (`note_transitions`) and applied, in submission order, when the list is submitted
 //! (`submitted`) – per subresource once a transition names one.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -80,6 +80,12 @@ struct Table {
     by_res: BTreeMap<usize, Entry>,
     /// Active `(va, PC texture)` → end address (`va + size`); entries with different `(va, end)` are disjoint
     by_va: BTreeMap<(usize, usize), usize>,
+    /// Active `(src, PC texture)` → source end address (`src + size`) for dirty-page lookups
+    by_src: BTreeMap<(usize, usize), usize>,
+    /// Largest byte span currently in `by_res` (bounds `by_src` range queries)
+    max_active_src_size: usize,
+    /// Active entries with `pending == true` waiting for their upload
+    pending_res: BTreeSet<usize>,
     /// Older overlapped textures kept dormant until released or uncovered when a newer one is released
     shadowed: BTreeMap<usize, Entry>,
     /// Shadowed `(va, PC texture)` → end address (may overlap)
@@ -94,11 +100,108 @@ impl Table {
         Table {
             by_res: BTreeMap::new(),
             by_va: BTreeMap::new(),
+            by_src: BTreeMap::new(),
+            max_active_src_size: 0,
+            pending_res: BTreeSet::new(),
             shadowed: BTreeMap::new(),
             shadowed_by_va: BTreeMap::new(),
             max_shadowed_size: 0,
             next_seq: 0,
         }
+    }
+
+    fn insert_active(&mut self, res: usize, entry: Entry) {
+        let size = entry.tex.size() as usize;
+        self.max_active_src_size = self.max_active_src_size.max(size);
+        self.by_va.insert((entry.va, res), entry.va.saturating_add(size));
+        self.by_src.insert((entry.src, res), entry.src.saturating_add(size));
+        if entry.pending {
+            self.pending_res.insert(res);
+        }
+        self.by_res.insert(res, entry);
+    }
+
+    fn remove_active(&mut self, res: usize) -> Option<Entry> {
+        let old = self.by_res.remove(&res)?;
+        self.by_va.remove(&(old.va, res));
+        self.by_src.remove(&(old.src, res));
+        self.pending_res.remove(&res);
+        Some(old)
+    }
+
+    fn recompute_max_active_src_size(&mut self) {
+        self.max_active_src_size = self.by_res.values().map(|e| e.tex.size() as usize).max().unwrap_or(0);
+    }
+
+    fn mark_pending(&mut self, res: usize) -> bool {
+        let Some(e) = self.by_res.get_mut(&res) else { return false };
+        if !e.gpu_written && !e.pending {
+            e.pending = true;
+            self.pending_res.insert(res);
+            return true;
+        }
+        false
+    }
+
+    fn push_dirty_overlaps(&self, start: usize, end: usize, hits: &mut Vec<usize>) {
+        if end <= start {
+            return;
+        }
+        let lo = start.saturating_sub(self.max_active_src_size);
+        let hi = if end == usize::MAX {
+            std::ops::Bound::Unbounded
+        } else {
+            std::ops::Bound::Excluded((end, 0))
+        };
+        for (&(_, res), &src_end) in self.by_src.range((std::ops::Bound::Included((lo, 0)), hi)) {
+            if src_end > start {
+                if let Some(e) = self.by_res.get(&res) {
+                    if !e.gpu_written && !e.pending {
+                        hits.push(res);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Collect active `res` IDs whose `src` span overlaps any sorted `dirty` page of `page` bytes
+    /// (excluding `gpu_written` entries) plus all `pending` entries, clearing `pending` on those
+    /// entries and returning `(sorted_unique_res, cleared_pending_count)`.
+    fn collect_dirty_and_pending(&mut self, dirty: &[usize], page: usize) -> (Vec<usize>, usize) {
+        if (dirty.is_empty() || page == 0 || self.by_src.is_empty()) && self.pending_res.is_empty() {
+            return (Vec::new(), 0);
+        }
+        let mut hits = Vec::new();
+        if !dirty.is_empty() && page > 0 && !self.by_src.is_empty() {
+            debug_assert!(dirty.windows(2).all(|w| w[0] <= w[1]));
+            let mut span_start = dirty[0];
+            let mut span_end = span_start.saturating_add(page);
+            for &p in &dirty[1..] {
+                if p <= span_end {
+                    span_end = span_end.max(p.saturating_add(page));
+                } else {
+                    self.push_dirty_overlaps(span_start, span_end, &mut hits);
+                    span_start = p;
+                    span_end = p.saturating_add(page);
+                }
+            }
+            self.push_dirty_overlaps(span_start, span_end, &mut hits);
+        }
+        let mut cleared = 0usize;
+        if !self.pending_res.is_empty() {
+            for res in std::mem::take(&mut self.pending_res) {
+                if let Some(e) = self.by_res.get_mut(&res) {
+                    if e.pending {
+                        e.pending = false;
+                        cleared += 1;
+                        hits.push(res);
+                    }
+                }
+            }
+        }
+        hits.sort_unstable();
+        hits.dedup();
+        (hits, cleared)
     }
 
     fn has_active_overlap(&self, va: usize, end: usize) -> bool {
@@ -143,9 +246,12 @@ impl Table {
     /// `(pending_delta, retired_count, placed_res_to_unmap)`.
     fn retire_range(&mut self, va: usize, end: usize) -> (isize, usize, Vec<usize>) {
         let (mut pending_delta, mut retired, mut to_unmap) = (0isize, 0usize, Vec::new());
-        for (ova, ores, _) in self.active_overlaps(va, end) {
-            self.by_va.remove(&(ova, ores));
-            if let Some(old) = self.by_res.remove(&ores) {
+        let mut shrink_max = false;
+        for (_, ores, _) in self.active_overlaps(va, end) {
+            if let Some(old) = self.remove_active(ores) {
+                if old.tex.size() as usize == self.max_active_src_size {
+                    shrink_max = true;
+                }
                 if old.pending {
                     pending_delta -= 1;
                 }
@@ -154,6 +260,9 @@ impl Table {
                 }
                 retired += 1;
             }
+        }
+        if shrink_max {
+            self.recompute_max_active_src_size();
         }
         for (sva, sres, _) in self.shadowed_overlaps(va, end) {
             self.shadowed_by_va.remove(&(sva, sres));
@@ -177,11 +286,15 @@ impl Table {
     /// exact same-range entries stay mapped because they already share every tile.
     fn insert(&mut self, res: usize, mut entry: Entry) -> (isize, Vec<usize>) {
         let va = entry.va;
-        let end = va.saturating_add(entry.tex.size() as usize);
+        let entry_size = entry.tex.size() as usize;
+        let end = va.saturating_add(entry_size);
         let mut pending_delta = 0isize;
         let mut to_unmap = Vec::new();
-        if let Some(old) = self.by_res.remove(&res) {
-            self.by_va.remove(&(old.va, res));
+        let mut shrink_max = false;
+        if let Some(old) = self.remove_active(res) {
+            if old.tex.size() as usize == self.max_active_src_size {
+                shrink_max = true;
+            }
             if old.pending {
                 pending_delta -= 1;
             }
@@ -193,8 +306,10 @@ impl Table {
             if !entry.placed && ova == va && oend == end && self.by_res.get(&ores).is_some_and(|e| !e.placed) {
                 continue;
             }
-            self.by_va.remove(&(ova, ores));
-            if let Some(mut old) = self.by_res.remove(&ores) {
+            if let Some(mut old) = self.remove_active(ores) {
+                if old.tex.size() as usize == self.max_active_src_size {
+                    shrink_max = true;
+                }
                 if old.pending {
                     pending_delta -= 1;
                 }
@@ -224,8 +339,11 @@ impl Table {
         if entry.pending {
             pending_delta += 1;
         }
-        self.by_va.insert((va, res), end);
-        self.by_res.insert(res, entry);
+        let needs_recompute = shrink_max && entry_size < self.max_active_src_size;
+        self.insert_active(res, entry);
+        if needs_recompute {
+            self.recompute_max_active_src_size();
+        }
         (pending_delta, to_unmap)
     }
 
@@ -239,8 +357,9 @@ impl Table {
             }
             return (true, 0, Vec::new());
         }
-        let Some(old) = self.by_res.remove(&res) else { return (false, 0, Vec::new()) };
-        self.by_va.remove(&(old.va, res));
+        let Some(old) = self.remove_active(res) else { return (false, 0, Vec::new()) };
+        let prev_max = self.max_active_src_size;
+        let mut shrink_max = old.tex.size() as usize == prev_max;
         let mut pending_delta = if old.pending { -1 } else { 0 };
         let va = old.va;
         let end = va.saturating_add(old.tex.size() as usize);
@@ -267,9 +386,14 @@ impl Table {
                 if e.pending {
                     pending_delta += 1;
                 }
-                self.by_va.insert((sva, sres), send);
-                self.by_res.insert(sres, e);
+                if e.tex.size() as usize >= prev_max {
+                    shrink_max = false;
+                }
+                self.insert_active(sres, e);
             }
+        }
+        if shrink_max {
+            self.recompute_max_active_src_size();
         }
         if self.shadowed.is_empty() {
             self.max_shadowed_size = 0;
@@ -429,8 +553,19 @@ fn recheck_gpu_view_sources() {
     let mut changed = false;
     // (the shadowed textures too: one comes back when the texture over it goes)
     let mut g = TEXTURES.lock().unwrap();
-    let t = &mut *g;
-    for e in t.by_res.values_mut().chain(t.shadowed.values_mut()) {
+    let Table { by_res, by_src, pending_res, shadowed, .. } = &mut *g;
+    for (&res, e) in by_res.iter_mut() {
+        let old_src = e.src;
+        if recheck_source(e) {
+            changed = true;
+            by_src.remove(&(old_src, res));
+            by_src.insert((e.src, res), e.src.saturating_add(e.tex.size() as usize));
+            if e.pending {
+                pending_res.insert(res);
+            }
+        }
+    }
+    for e in shadowed.values_mut() {
         changed |= recheck_source(e);
     }
     drop(g);
@@ -804,23 +939,13 @@ unsafe fn refresh_once(queue: *mut c_void) {
     let todo: Vec<(ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
         let dirty = dcell.borrow();
         let mut t = TEXTURES.lock().unwrap();
-        t.by_res
-            .iter_mut()
-            .filter(|(_, e)| {
-                if e.pending {
-                    return true;
-                }
-                if e.gpu_written {
-                    return false;
-                }
-                let i = dirty.partition_point(|&p| p + page as usize <= e.src);
-                dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
-            })
-            .filter_map(|(&res, e)| {
-                if e.pending {
-                    e.pending = false;
-                    PENDING.fetch_sub(1, Ordering::Relaxed);
-                }
+        let (hits, cleared) = t.collect_dirty_and_pending(&dirty, page as usize);
+        if cleared > 0 {
+            PENDING.fetch_sub(cleared, Ordering::Relaxed);
+        }
+        hits.into_iter()
+            .filter_map(|res| {
+                let e = t.by_res.get(&res)?;
                 let p = res as *mut c_void;
                 ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.src, Arc::clone(&e.tex), e.states.clone())))
             })
@@ -1052,12 +1177,9 @@ unsafe fn recheck_streamed_unwatched_at(watched: &[(usize, usize)], frame: u64) 
         {
             let mut t = TEXTURES.lock().unwrap();
             for res in changed {
-                if let Some(e) = t.by_res.get_mut(&res) {
-                    if !e.gpu_written && !e.pending {
-                        e.pending = true;
-                        PENDING.fetch_add(1, Ordering::Relaxed);
-                        queued += 1;
-                    }
+                if t.mark_pending(res) {
+                    PENDING.fetch_add(1, Ordering::Relaxed);
+                    queued += 1;
                 }
             }
         }
@@ -2629,5 +2751,155 @@ mod tests {
 
         // Different device always starts a new batch.
         assert!(!batch_fits(1, 4096, 1, 2, 4096));
+    }
+
+    fn test_entry(va: usize, src: usize, tex: &Arc<xg::Texture>, pending: bool, gpu_written: bool, placed: bool) -> Entry {
+        Entry { device: 0, va, src, in_gpu_view: src != va, tex: Arc::clone(tex), states: vec![D3D12_RESOURCE_STATE_COMMON], pending, gpu_written, placed, unmapped: false, seq: 0 }
+    }
+
+    fn assert_table_invariants(tbl: &Table) {
+        let mut expected_max = 0usize;
+        let mut expected_pending = BTreeSet::new();
+        assert_eq!(tbl.by_src.len(), tbl.by_res.len(), "by_src must track every active entry");
+        assert_eq!(tbl.by_va.len(), tbl.by_res.len(), "by_va must track every active entry");
+        for (&res, e) in &tbl.by_res {
+            let sz = e.tex.size() as usize;
+            expected_max = expected_max.max(sz);
+            assert_eq!(tbl.by_src.get(&(e.src, res)), Some(&e.src.saturating_add(sz)));
+            assert_eq!(tbl.by_va.get(&(e.va, res)), Some(&e.va.saturating_add(sz)));
+            if e.pending { expected_pending.insert(res); }
+        }
+        assert_eq!((tbl.max_active_src_size, &tbl.pending_res), (expected_max, &expected_pending));
+    }
+
+    fn reference_collect(tbl: &Table, dirty: &[usize], page: usize) -> (Vec<usize>, usize) {
+        let (mut out, mut cleared) = (Vec::new(), 0usize);
+        for (&res, e) in &tbl.by_res {
+            if e.pending {
+                out.push(res);
+                cleared += 1;
+            } else if !e.gpu_written && page > 0 {
+                let i = dirty.partition_point(|&p| p.saturating_add(page) <= e.src);
+                if dirty.get(i).is_some_and(|&p| p < e.src.saturating_add(e.tex.size() as usize)) {
+                    out.push(res);
+                }
+            }
+        }
+        (out, cleared)
+    }
+
+    #[test]
+    fn dirty_index_matches_exact_boundaries_coalesced_runs_and_saturating_bounds() {
+        let tex_16k = Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 1, 1, 28, 0x105)).unwrap());
+        let tex_64k = Arc::new(xg::Texture::new(&console_desc(3, 128, 128, 1, 1, 28, 0x105)).unwrap());
+        assert_eq!((tex_16k.size(), tex_64k.size()), (0x4000, 0x1_0000));
+        let mut tbl = Table::new();
+        // Exact boundary checks around dirty page [0x10_2000, 0x10_3000) (page = 0x1000):
+        // 1: src+size==start (out), 2: src+size==start+1 (in), 3: src==end (out), 4: src==end-1 (in),
+        // 5: spans coalesced run + disjoint hit, 6: gpu_written, 7: usize::MAX boundary.
+        for (res, va) in [(1, 0x0F_E000), (2, 0x0F_E001), (3, 0x10_3000), (4, 0x10_2FFF), (7, usize::MAX - 0x0FFF)] {
+            tbl.insert(res, test_entry(va, va, &tex_16k, false, false, false));
+        }
+        tbl.insert(5, test_entry(0x20_0000, 0x20_0000, &tex_64k, false, false, false));
+        tbl.insert(6, test_entry(0x30_0000, 0x30_0000, &tex_16k, false, true, false));
+        assert_table_invariants(&tbl);
+        assert_eq!(tbl.collect_dirty_and_pending(&[], 0x1000), (Vec::new(), 0));
+        assert_eq!(tbl.collect_dirty_and_pending(&[0x10_2000], 0), (Vec::new(), 0));
+        let dirty = [0x10_2000, 0x10_2000, 0x20_0000, 0x20_1000, 0x20_F000, 0x30_0000, usize::MAX - 0x0FFF];
+        let expected = reference_collect(&tbl, &dirty, 0x1000);
+        assert_eq!(expected, (vec![2, 4, 5, 7], 0));
+        assert_eq!(tbl.collect_dirty_and_pending(&dirty, 0x1000), expected);
+        tbl.remove(5);
+        assert_eq!(tbl.max_active_src_size, 0x4000);
+        assert_table_invariants(&tbl);
+    }
+
+    #[test]
+    fn dirty_index_tracks_mirrors_shadowing_retirement_and_pending_drains() {
+        let tex_16k = Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 1, 1, 28, 0x105)).unwrap());
+        let tex_64k = Arc::new(xg::Texture::new(&console_desc(3, 128, 128, 1, 1, 28, 0x105)).unwrap());
+        let mut tbl = Table::new();
+        tbl.insert(1, test_entry(0x8000_0000, 0x4000_0000, &tex_16k, false, false, true)); // mirror src != va
+        tbl.insert(2, test_entry(0x5000_0000, 0x5000_0000, &tex_16k, true, true, false)); // pending + gpu_written
+        tbl.insert(3, test_entry(0x6000_0000, 0x6000_0000, &tex_16k, false, false, false));
+        assert!(tbl.mark_pending(3) && !tbl.mark_pending(2) && !tbl.mark_pending(3));
+        assert_table_invariants(&tbl);
+        assert_eq!(tbl.collect_dirty_and_pending(&[0x8000_0000], 0x1000), (vec![2, 3], 2));
+        assert_table_invariants(&tbl);
+        assert_eq!(tbl.collect_dirty_and_pending(&[0x4000_1000, 0x5000_0000], 0x1000), (vec![1], 0));
+
+        // Shadow res 1 with res 4, then remove res 4 to uncover res 1 (unmapped -> pending).
+        tbl.insert(4, test_entry(0x8000_0000, 0x8000_0000, &tex_64k, false, false, true));
+        assert_eq!(tbl.max_active_src_size, 0x1_0000);
+        assert_table_invariants(&tbl);
+        assert_eq!(tbl.collect_dirty_and_pending(&[0x4000_1000], 0x1000), (Vec::new(), 0));
+        assert_eq!(tbl.remove(4).1, 1);
+        assert_eq!(tbl.max_active_src_size, 0x4000);
+        assert_table_invariants(&tbl);
+        assert_eq!(tbl.collect_dirty_and_pending(&[], 0x1000), (vec![1], 1));
+
+        // Simulate recheck_gpu_view_sources updating src from CPU mirror back to GPU va.
+        let old_src = tbl.by_res.get(&1).unwrap().src;
+        let e = tbl.by_res.get_mut(&1).unwrap();
+        e.src = e.va;
+        e.pending = true;
+        tbl.by_src.remove(&(old_src, 1));
+        tbl.by_src.insert((e.src, 1), e.src.saturating_add(e.tex.size() as usize));
+        tbl.pending_res.insert(1);
+        assert_table_invariants(&tbl);
+        assert_eq!(tbl.collect_dirty_and_pending(&[], 0x1000), (vec![1], 1));
+        assert_eq!(tbl.collect_dirty_and_pending(&[0x8000_2000], 0x1000), (vec![1], 0));
+
+        tbl.insert(5, test_entry(0x9000_0000, 0x9000_0000, &tex_64k, true, false, true));
+        assert_eq!(tbl.retire_range(0x8000_0000, 0x9001_0000).0, -1);
+        assert_eq!(tbl.max_active_src_size, 0x4000);
+        assert_table_invariants(&tbl);
+    }
+
+    #[test]
+    fn dirty_index_parity_with_full_scan_across_randomized_mutations_and_16k_textures() {
+        let descs = [
+            Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 1, 1, 28, 0x105)).unwrap()),
+            Arc::new(xg::Texture::new(&console_desc(3, 128, 128, 1, 1, 28, 0x105)).unwrap()),
+            Arc::new(xg::Texture::new(&console_desc(3, 256, 256, 1, 1, 28, 0x105)).unwrap()),
+        ];
+        let (mut tbl, mut rng) = (Table::new(), 0x9E37_79B9_7F4A_7C15u64);
+        let mut next = || -> u64 { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; rng };
+        for step in 0..300 {
+            match next() % 5 {
+                0..=1 => {
+                    let res = 1 + (next() as usize % 80);
+                    let va = 0x1000_0000 + ((next() as usize % 256) * 0x1000);
+                    let src = if next() % 3 == 0 { 0x2000_0000 + ((next() as usize % 256) * 0x1000) } else { va };
+                    let tex = &descs[next() as usize % descs.len()];
+                    tbl.insert(res, test_entry(va, src, tex, next() % 4 == 0, next() % 5 == 0, next() % 2 == 0));
+                }
+                2 => { tbl.remove(1 + (next() as usize % 80)); }
+                3 => {
+                    let va = 0x1000_0000 + ((next() as usize % 256) * 0x1000);
+                    tbl.retire_range(va, va + (1 + (next() as usize % 16)) * 0x1000);
+                }
+                _ => { tbl.mark_pending(1 + (next() as usize % 80)); }
+            }
+            assert_table_invariants(&tbl);
+            if step % 3 == 0 {
+                let mut dirty: Vec<usize> = (0..(next() % 18))
+                    .map(|_| (if next() % 2 == 0 { 0x1000_0000 } else { 0x2000_0000 }) + ((next() as usize % 260) * 0x1000))
+                    .collect();
+                dirty.sort_unstable();
+                let expected = reference_collect(&tbl, &dirty, 0x1000);
+                assert_eq!(tbl.collect_dirty_and_pending(&dirty, 0x1000), expected, "step {step}");
+                assert_table_invariants(&tbl);
+            }
+        }
+        let mut big = Table::new();
+        for i in 1..=16_000usize {
+            let va = 0x4000_0000 + i * 0x1_0000;
+            big.insert(i, test_entry(va, va, &descs[i % 3], i % 500 == 0, false, false));
+        }
+        let dirty = [0x4000_0000 + 42 * 0x1_0000, 0x4000_0000 + 9999 * 0x1_0000 + 0x1000];
+        let expected = reference_collect(&big, &dirty, 0x1000);
+        assert_eq!(big.collect_dirty_and_pending(&dirty, 0x1000), expected);
+        assert_table_invariants(&big);
     }
 }
