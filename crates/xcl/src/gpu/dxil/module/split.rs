@@ -1081,4 +1081,86 @@ mod tests {
         }
     }
 
+    /// Static-slot `xcl_scratch` is promoted before `split_compute`, unblocking
+    /// multi-piece compute splitting on kernels whose only alloca was scratch.
+    #[test]
+    fn dispatch_chain_promotes_static_scratch_and_matches_gpu() {
+        use super::Op;
+        let build = |sroa: bool| {
+            let geometry = [32, 1, 1];
+            let cs = CsInterface { threads: geometry, ..Default::default() };
+            let options = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+            let mut lw = Lw::new(&[], &Default::default(), options, &Entry::Compute(cs));
+            let (tid, _) = lw.setup_lanes_compute(geometry, false);
+            let mem = lw.mems[0];
+            let offset = lw.shlc(tid, 2);
+            let input = lw.s.raw_load(mem, offset, 1)[0];
+
+            let i32t = lw.s.m.i32();
+            let arr_t = lw.s.m.array(1024, i32t);
+            let scratch = lw.s.m.alloca(arr_t, 4);
+            let z = lw.c(0);
+            let c1 = lw.c(1);
+            let c5 = lw.c(5);
+            let p0 = lw.s.m.gep(scratch, &[z, z]);
+            let p1 = lw.s.m.gep(scratch, &[z, c5]);
+            lw.s.m.store(p0, input, 4);
+            lw.s.m.store(p1, tid, 4);
+
+            let trips = lw.andc(tid, 3);
+            let trips = lw.addc(trips, 1);
+            for round in 1..=10u32 {
+                let pred = lw.cur();
+                let body = lw.s.m.new_block();
+                let exit = lw.s.m.new_block();
+                lw.s.m.br(body);
+                lw.s.m.set_block(body);
+                let iv = lw.s.m.phi(i32t);
+                lw.s.m.add_incoming(iv, z, pred);
+                let cur0 = lw.s.m.load(p0, 4);
+                let cur1 = lw.s.m.load(p1, 4);
+                let upd0 = lw.add(cur0, cur1);
+                let upd1 = lw.addc(cur1, round);
+                lw.s.m.store(p0, upd0, 4);
+                lw.s.m.store(p1, upd1, 4);
+                let next = lw.add(iv, c1);
+                lw.s.m.add_incoming(iv, next, body);
+                let again = lw.cmp(Pred::ULt, next, trips);
+                lw.s.m.cond_br(again, body, exit);
+                lw.s.m.set_block(exit);
+            }
+            let out0 = lw.s.m.load(p0, 4);
+            let out1 = lw.s.m.load(p1, 4);
+            let out = lw.xor(out0, out1);
+            lw.s.raw_store(mem, offset, &[out]);
+            lw.s.m.ret();
+
+            if sroa { lw.s.m.optimize(); } else { lw.s.m.optimize_no_sroa(); }
+            lw
+        };
+        let geometry = [32, 1, 1];
+        let unpromoted = build(false);
+        assert!(unpromoted.s.split_compute(geometry, None, 40).is_none(), "unpromoted alloca must stay whole");
+        let unpromoted_insts: usize = unpromoted.s.m.blocks.iter().map(Vec::len).sum();
+        let unpromoted_dxil = unpromoted.s.finish_optimized(geometry, Some(32)).unwrap();
+
+        let lw = build(true);
+        assert!(
+            !lw.s.m.blocks.iter().flatten().any(|&i| matches!(lw.s.m.insts[i as usize].op, Op::Alloca(..) | Op::Load(..) | Op::Store(..))),
+            "static xcl_scratch must be fully promoted before split_compute"
+        );
+        let promoted_insts: usize = lw.s.m.blocks.iter().map(Vec::len).sum();
+        let chain = lw.s.split_compute(geometry, None, 40).expect("static scratch kernel splits");
+        assert!(chain.pieces.len() >= 2);
+        let whole = lw.s.finish_optimized(geometry, Some(32)).unwrap();
+        crate::gpu::dxil::validate::validate(&whole).unwrap();
+        println!("SCRATCH_SROA insts={unpromoted_insts}->{promoted_insts} dxil_bytes={}->{} pieces={}", unpromoted_dxil.len(), whole.len(), chain.pieces.len());
+
+        if !runner::wave32_supported().unwrap_or(false) {
+            return runner::skip_test("no wave32 GPU");
+        }
+        let initial: Vec<u32> = (1..=64).collect();
+        assert_eq!(runner::dispatch_split(&chain, [2, 1, 1], &initial).unwrap(), runner::dispatch(&whole, [2, 1, 1], &[], &initial).unwrap());
+    }
+
 }

@@ -426,10 +426,19 @@ impl Module {
     /// Cleans up the entry function (see the module docs of `opt`). Values
     /// keep their identities; replaced ones simply lose their uses.
     ///
-    /// `XCL_DXIL_NO_OPT=phi,cse,dce,merge` (any subset, or `all`) skips passes, for bisecting.
+    /// `XCL_DXIL_NO_OPT=phi,cse,dce,sroa,merge` (any subset, or `all`) skips passes, for bisecting.
     pub fn optimize(&mut self) {
+        self.optimize_inner(true);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn optimize_no_sroa(&mut self) {
+        self.optimize_inner(false);
+    }
+
+    fn optimize_inner(&mut self, allow_sroa: bool) {
         let off = std::env::var("XCL_DXIL_NO_OPT").unwrap_or_default();
-        let skip = |p: &str| off.split(',').any(|x| x.trim() == p || x.trim() == "all");
+        let skip = |p: &str| off.split(',').any(|x| x.trim() == p || x.trim() == "all") || (!allow_sroa && p == "sroa");
         let order: Vec<u32> = self.block_layout().0.into_iter().map(|b| b as u32).collect();
         // malformed IR (a use before its definition or of a void result) is left for the
         // writer to report, not cleaned away
@@ -455,12 +464,33 @@ impl Module {
             }
         }
 
-        let mut repl: Vec<Option<Value>> = vec![None; self.insts.len()];
+        let (i64t, f64t) = self.existing_i64_f64();
+        let wide: Vec<Ty> = i64t.into_iter().chain(f64t).collect();
+        self.run_phi_cse_dce(&order, &wide, &skip);
 
-        // trivial phis (all incoming values the phi itself or one value), to a fixed point
-        while !skip("phi") {
+        if !skip("sroa") && self.promote_allocas(&order) {
+            self.run_phi_cse_dce(&order, &wide, &skip);
+        }
+
+        if !skip("merge") && self.simplify_cfg() {
+            let order: Vec<u32> = self.block_layout().0.into_iter().map(|b| b as u32).collect();
+            let mut repl2: Vec<Option<Value>> = vec![None; self.insts.len()];
+            let phi_changed = !skip("phi") && self.elim_trivial_phis(&order, &mut repl2);
+            if phi_changed {
+                self.resolve_operands(&order, &mut repl2);
+            }
+            if !skip("dce") {
+                self.dce(&order, &repl2, &wide, false);
+            }
+            debug_assert!(self.uses_well_formed(&order));
+        }
+    }
+
+    fn elim_trivial_phis(&mut self, order: &[u32], repl: &mut [Option<Value>]) -> bool {
+        let mut ever = false;
+        loop {
             let mut changed = false;
-            for &b in &order {
+            for &b in order {
                 for &i in &self.blocks[b as usize] {
                     let i = i as usize;
                     if repl[i].is_some() {
@@ -471,7 +501,7 @@ impl Module {
                     let mut same: Option<Value> = None;
                     let mut trivial = true;
                     for &(v, _) in inc {
-                        let v = resolve(&mut repl, v);
+                        let v = resolve(repl, v);
                         if v == me || Some(v) == same {
                             continue;
                         }
@@ -484,6 +514,7 @@ impl Module {
                     if let (true, Some(v)) = (trivial, same) {
                         repl[i] = Some(v);
                         changed = true;
+                        ever = true;
                     }
                 }
             }
@@ -491,9 +522,52 @@ impl Module {
                 break;
             }
         }
+        ever
+    }
+
+    fn resolve_operands(&mut self, order: &[u32], repl: &mut [Option<Value>]) {
+        for &b in order {
+            for k in 0..self.blocks[b as usize].len() {
+                let i = self.blocks[b as usize][k] as usize;
+                self.insts[i].op.map_operands(|v| resolve(repl, v));
+            }
+        }
+    }
+
+    fn dce(&mut self, order: &[u32], repl: &[Option<Value>], wide: &[Ty], skip_dce: bool) {
+        let mut live = vec![false; self.insts.len()];
+        let mut work: Vec<u32> = Vec::new();
+        for &b in order {
+            for &i in &self.blocks[b as usize] {
+                if repl[i as usize].is_none() && (skip_dce || !self.removable(&self.insts[i as usize].op, self.insts[i as usize].ty, wide)) {
+                    live[i as usize] = true;
+                    work.push(i);
+                }
+            }
+        }
+        while let Some(i) = work.pop() {
+            self.insts[i as usize].op.for_each_operand(|v| {
+                if let Value::Inst(j) = v {
+                    if !live[j as usize] {
+                        live[j as usize] = true;
+                        work.push(j);
+                    }
+                }
+            });
+        }
+        for b in &mut self.blocks {
+            b.retain(|&i| live[i as usize]);
+        }
+    }
+
+    fn run_phi_cse_dce(&mut self, order: &[u32], wide: &[Ty], skip: &dyn Fn(&str) -> bool) {
+        let mut repl: Vec<Option<Value>> = vec![None; self.insts.len()];
+        if !skip("phi") {
+            self.elim_trivial_phis(order, &mut repl);
+        }
 
         // CSE along the dominator tree (preorder walk with a scoped table)
-        let idom = self.idoms(&order);
+        let idom = self.idoms(order);
         let mut kids: Vec<Vec<usize>> = vec![Vec::new(); self.blocks.len()];
         for &b in order.iter().skip(1) {
             if let Some(d) = idom[b as usize] {
@@ -501,7 +575,6 @@ impl Module {
             }
         }
         let mut table: HashMap<(Op, Ty), Value> = HashMap::new();
-        // (block, undo log length) frames; undo log holds keys to remove / restore
         let mut undo: Vec<((Op, Ty), Option<Value>)> = Vec::new();
         enum Step {
             Enter(usize),
@@ -562,148 +635,267 @@ impl Module {
         }
         // second trivial-phi fixed point if CSE/simplification collapsed incoming values
         if cse_replaced && !skip("phi") {
-            loop {
-                let mut changed = false;
-                for &b in &order {
-                    for &i in &self.blocks[b as usize] {
-                        let i = i as usize;
-                        if repl[i].is_some() {
-                            continue;
-                        }
-                        let Op::Phi(inc) = &self.insts[i].op else { break };
-                        let me = Value::Inst(i as u32);
-                        let mut same: Option<Value> = None;
-                        let mut trivial = true;
-                        for &(v, _) in inc {
-                            let v = resolve(&mut repl, v);
-                            if v == me || Some(v) == same {
-                                continue;
-                            }
-                            if same.is_some() {
-                                trivial = false;
-                                break;
-                            }
-                            same = Some(v);
-                        }
-                        if let (true, Some(v)) = (trivial, same) {
-                            repl[i] = Some(v);
-                            changed = true;
+            self.elim_trivial_phis(order, &mut repl);
+        }
+        // phis may name values defined later (back edges): resolve once more
+        self.resolve_operands(order, &mut repl);
+        self.dce(order, &repl, wide, skip("dce"));
+    }
+
+    /// Promotes entry-block `[N x i32]` `Op::Alloca`s whose every reachable use is an
+    /// in-bounds constant-slot `Gep(alloca, [0, slot])` read/written strictly by `i32`
+    /// `Load`/`Store`s into SSA values and `Phi` nodes (Cytron et al.), initializing unread
+    /// slots to `0i32`. Returns `true` if at least one alloca was promoted.
+    fn promote_allocas(&mut self, order: &[u32]) -> bool {
+        use std::collections::{BTreeMap, HashSet};
+        let Some(i32_ty) = self.type_ids.get(&super::TypeDef::Int(32)).copied() else {
+            return false;
+        };
+        let mut cands: Vec<(u32, u64)> = Vec::new();
+        let mut cand_of: HashMap<u32, usize> = HashMap::new();
+        for &i in &self.blocks[0] {
+            if let Op::Alloca(arr_ty, count, _) = self.insts[i as usize].op {
+                if self.const_u64(count) == Some(1) {
+                    if let super::TypeDef::Array(len, elem) = self.types[arr_ty.0 as usize] {
+                        if len > 0 && elem == i32_ty {
+                            cand_of.insert(i, cands.len());
+                            cands.push((i, len));
                         }
                     }
                 }
-                if !changed {
-                    break;
-                }
             }
         }
-        // phis may name values defined later (back edges): resolve once more
-        for &b in &order {
-            for k in 0..self.blocks[b as usize].len() {
-                let i = self.blocks[b as usize][k] as usize;
-                self.insts[i].op.map_operands(|v| resolve(&mut repl, v));
+        if cands.is_empty() {
+            return false;
+        }
+
+        let mut md_insts = HashSet::new();
+        for m in &self.md {
+            if let super::MdDef::Val(_, Value::Inst(id)) = m {
+                md_insts.insert(*id);
+            }
+        }
+        let mut valid: Vec<bool> = cands.iter().map(|&(id, _)| !md_insts.contains(&id)).collect();
+        let mut geps: HashMap<u32, (usize, u64)> = HashMap::new();
+
+        for &b in order {
+            for &i in &self.blocks[b as usize] {
+                let def = &self.insts[i as usize];
+                if let Op::Gep(Value::Inst(base), idx) = &def.op {
+                    if let Some(&ai) = cand_of.get(base) {
+                        let ok = idx.len() == 2
+                            && self.value_ty(idx[0]) == i32_ty
+                            && self.value_ty(idx[1]) == i32_ty
+                            && self.const_u64(idx[0]) == Some(0)
+                            && self.const_u64(idx[1]).is_some_and(|s| s < cands[ai].1 && s <= i32::MAX as u64)
+                            && idx.iter().all(|&x| x != Value::Inst(*base))
+                            && self.pointee_of(def.ty) == Some((i32_ty, 0))
+                            && !md_insts.contains(&i);
+                        if ok {
+                            geps.insert(i, (ai, self.const_u64(idx[1]).unwrap()));
+                        } else {
+                            valid[ai] = false;
+                        }
+                        continue;
+                    }
+                }
+                def.op.for_each_operand(|v| {
+                    if let Value::Inst(id) = v {
+                        if let Some(&ai) = cand_of.get(&id) {
+                            valid[ai] = false;
+                        }
+                    }
+                });
             }
         }
 
-        // dead instructions: live = side effects, terminators and their operands, transitively
-        let (i64t, f64t) = self.existing_i64_f64();
-        let wide: Vec<Ty> = i64t.into_iter().chain(f64t).collect();
-        let mut live = vec![false; self.insts.len()];
-        let mut work: Vec<u32> = Vec::new();
-        for &b in &order {
+        #[derive(Clone, Copy)]
+        enum MemOp {
+            Load(usize, u64),
+            Store(usize, u64, Value),
+        }
+        let mut mem_ops: Vec<(u32, usize, MemOp)> = Vec::new();
+        for &b in order {
             for &i in &self.blocks[b as usize] {
-                if repl[i as usize].is_none() && (skip("dce") || !self.removable(&self.insts[i as usize].op, self.insts[i as usize].ty, &wide)) {
-                    live[i as usize] = true;
-                    work.push(i);
+                let def = &self.insts[i as usize];
+                match def.op {
+                    Op::Load(Value::Inst(g), _) if geps.contains_key(&g) && def.ty == i32_ty => {
+                        let (ai, slot) = geps[&g];
+                        mem_ops.push((i, b as usize, MemOp::Load(ai, slot)));
+                    }
+                    Op::Store(Value::Inst(g), val, _)
+                        if geps.contains_key(&g)
+                            && val != Value::Inst(g)
+                            && val != Value::Inst(cands[geps[&g].0].0)
+                            && self.value_ty(val) == i32_ty =>
+                    {
+                        let (ai, slot) = geps[&g];
+                        mem_ops.push((i, b as usize, MemOp::Store(ai, slot, val)));
+                    }
+                    _ => def.op.for_each_operand(|v| {
+                        if let Value::Inst(id) = v {
+                            if let Some(&(ai, _)) = geps.get(&id) {
+                                valid[ai] = false;
+                            }
+                        }
+                    }),
                 }
             }
         }
-        while let Some(i) = work.pop() {
-            self.insts[i as usize].op.for_each_operand(|v| {
-                if let Value::Inst(j) = v {
-                    if !live[j as usize] {
-                        live[j as usize] = true;
-                        work.push(j);
+        if !valid.iter().any(|&v| v) {
+            return false;
+        }
+
+        let mut vars: BTreeMap<(usize, u64), usize> = BTreeMap::new();
+        let mut def_blocks: Vec<Vec<usize>> = Vec::new();
+        #[derive(Clone, Copy)]
+        enum SlotOp {
+            Load(usize),
+            Store(usize, Value),
+        }
+        let mut slot_ops: Vec<Option<SlotOp>> = vec![None; self.insts.len()];
+        for &(inst_id, blk, op) in &mem_ops {
+            let (ai, slot) = match op {
+                MemOp::Load(ai, slot) | MemOp::Store(ai, slot, _) => (ai, slot),
+            };
+            if !valid[ai] {
+                continue;
+            }
+            let var = *vars.entry((ai, slot)).or_insert_with(|| {
+                def_blocks.push(Vec::new());
+                def_blocks.len() - 1
+            });
+            slot_ops[inst_id as usize] = Some(match op {
+                MemOp::Load(..) => SlotOp::Load(var),
+                MemOp::Store(_, _, val) => {
+                    if def_blocks[var].last() != Some(&blk) {
+                        def_blocks[var].push(blk);
                     }
+                    SlotOp::Store(var, val)
                 }
             });
         }
-        for b in &mut self.blocks {
-            b.retain(|&i| live[i as usize]);
+        let num_vars = def_blocks.len();
+        if num_vars == 0 {
+            return false;
         }
 
-        if !skip("merge") && self.simplify_cfg() {
-            let order: Vec<u32> = self.block_layout().0.into_iter().map(|b| b as u32).collect();
-            let mut repl2: Vec<Option<Value>> = vec![None; self.insts.len()];
-            let mut phi_changed = false;
-            while !skip("phi") {
-                let mut changed = false;
-                for &b in &order {
-                    for &i in &self.blocks[b as usize] {
-                        let i = i as usize;
-                        if repl2[i].is_some() {
-                            continue;
-                        }
-                        let Op::Phi(inc) = &self.insts[i].op else { break };
-                        let me = Value::Inst(i as u32);
-                        let mut same: Option<Value> = None;
-                        let mut trivial = true;
-                        for &(v, _) in inc {
-                            let v = resolve(&mut repl2, v);
-                            if v == me || Some(v) == same {
-                                continue;
-                            }
-                            if same.is_some() {
-                                trivial = false;
-                                break;
-                            }
-                            same = Some(v);
-                        }
-                        if let (true, Some(v)) = (trivial, same) {
-                            repl2[i] = Some(v);
-                            changed = true;
-                            phi_changed = true;
-                        }
-                    }
-                }
-                if !changed {
-                    break;
-                }
+        let n = self.blocks.len();
+        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for &b in order {
+            for s in self.successors(b as usize) {
+                preds[s.0 as usize].push(b as usize);
             }
-            if phi_changed {
-                for &b in &order {
-                    for k in 0..self.blocks[b as usize].len() {
-                        let i = self.blocks[b as usize][k] as usize;
-                        self.insts[i].op.map_operands(|v| resolve(&mut repl2, v));
-                    }
-                }
-            }
-            if !skip("dce") {
-                live.fill(false);
-                work.clear();
-                for &b in &order {
-                    for &i in &self.blocks[b as usize] {
-                        if repl2[i as usize].is_none() && !self.removable(&self.insts[i as usize].op, self.insts[i as usize].ty, &wide) {
-                            live[i as usize] = true;
-                            work.push(i);
-                        }
-                    }
-                }
-                while let Some(i) = work.pop() {
-                    self.insts[i as usize].op.for_each_operand(|v| {
-                        if let Value::Inst(j) = v {
-                            if !live[j as usize] {
-                                live[j as usize] = true;
-                                work.push(j);
-                            }
-                        }
-                    });
-                }
-                for b in &mut self.blocks {
-                    b.retain(|&i| live[i as usize]);
-                }
-            }
-            debug_assert!(self.uses_well_formed(&order));
         }
+        if !preds[0].is_empty() {
+            return false;
+        }
+        let idom = self.idoms(order);
+        let mut kids: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for &b in order.iter().skip(1) {
+            if let Some(d) = idom[b as usize] {
+                kids[d].push(b as usize);
+            }
+        }
+        let mut df: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for &b_u32 in order {
+            let b = b_u32 as usize;
+            if b == 0 || preds[b].len() < 2 {
+                continue;
+            }
+            let Some(stop) = idom[b] else { continue };
+            for &p in &preds[b] {
+                let mut runner = p;
+                while runner != stop {
+                    if !df[runner].contains(&b) {
+                        df[runner].push(b);
+                    }
+                    if runner == 0 {
+                        break;
+                    }
+                    let Some(up) = idom[runner] else { break };
+                    runner = up;
+                }
+            }
+        }
+
+        let mut has_phi = vec![0usize; n];
+        let mut in_work = vec![0usize; n];
+        let mut block_phis: Vec<Vec<(usize, Value)>> = vec![Vec::new(); n];
+        let mut work = Vec::new();
+        for (var, defs) in def_blocks.iter().enumerate() {
+            let stamp = var + 1;
+            work.clear();
+            for &b in defs {
+                in_work[b] = stamp;
+                work.push(b);
+            }
+            while let Some(b) = work.pop() {
+                for &f in &df[b] {
+                    if has_phi[f] != stamp {
+                        has_phi[f] = stamp;
+                        let phi = self.phi_at(Block(f as u32), i32_ty);
+                        block_phis[f].push((var, phi));
+                        if in_work[f] != stamp {
+                            in_work[f] = stamp;
+                            work.push(f);
+                        }
+                    }
+                }
+            }
+        }
+
+        let zero = self.i32c(0);
+        let mut cur = vec![zero; num_vars];
+        let mut undo: Vec<(usize, Value)> = Vec::new();
+        let mut repl: Vec<Option<Value>> = vec![None; self.insts.len()];
+        enum Step {
+            Enter(usize),
+            Leave(usize),
+        }
+        let mut stack = vec![Step::Enter(0)];
+        while let Some(step) = stack.pop() {
+            let b = match step {
+                Step::Leave(mark) => {
+                    while undo.len() > mark {
+                        let (var, old) = undo.pop().unwrap();
+                        cur[var] = old;
+                    }
+                    continue;
+                }
+                Step::Enter(b) => b,
+            };
+            stack.push(Step::Leave(undo.len()));
+            for &(var, phi) in &block_phis[b] {
+                undo.push((var, cur[var]));
+                cur[var] = phi;
+            }
+            for &i in &self.blocks[b] {
+                match slot_ops.get(i as usize).copied().flatten() {
+                    Some(SlotOp::Load(var)) => repl[i as usize] = Some(cur[var]),
+                    Some(SlotOp::Store(var, val)) => {
+                        let v = resolve(&mut repl, val);
+                        undo.push((var, cur[var]));
+                        cur[var] = v;
+                    }
+                    None => {}
+                }
+            }
+            for s in self.successors(b) {
+                for &(var, phi) in &block_phis[s.0 as usize] {
+                    self.add_incoming(phi, cur[var], Block(b as u32));
+                }
+            }
+            for &c in kids[b].iter().rev() {
+                stack.push(Step::Enter(c));
+            }
+        }
+
+        for &b in order {
+            self.blocks[b as usize].retain(|&i| !matches!(slot_ops.get(i as usize).copied().flatten(), Some(SlotOp::Store(..))));
+        }
+        self.resolve_operands(order, &mut repl);
+        true
     }
 
     /// Simplifies the CFG to a fixed point:
@@ -1397,6 +1589,216 @@ mod tests {
         assert_eq!(m.const_u64(args[10]), Some(u32::MAX as u64), "or(or(x, 0xFFFF), 0xFFFF0000) -> ~0");
         assert_eq!(args[11], z, "and(zext(i1), 0xFF) -> zext(i1)");
         assert_eq!(m.const_u64(args[12]), Some(0), "and(zext(i1), 0xFFFF0000) -> 0");
+        let order: Vec<u32> = m.block_layout().0.into_iter().map(|b| b as u32).collect();
+        assert!(m.uses_well_formed(&order));
+    }
+
+    fn count_ops(m: &Module, pred: impl Fn(&Op) -> bool) -> usize {
+        m.blocks.iter().flat_map(|b| b.iter()).filter(|&&i| pred(&m.insts[i as usize].op)).count()
+    }
+
+    #[test]
+    fn sroa_promotes_constant_scratch_across_branches_loops_and_multi_edges() {
+        use crate::gpu::dxil::{container::Stage, shader::Shader, validate};
+
+        let mut s = Shader::new(Stage::Compute, (6, 6));
+        let lane = s.wave_lane_index();
+        let mem = s.raw_uav(2, 0);
+        let i32t = s.m.i32();
+        let arr_t = s.m.array(16, i32t);
+        let scratch = s.m.alloca(arr_t, 4);
+        let c0 = s.m.i32c(0);
+        let c1 = s.m.i32c(1);
+        let c2 = s.m.i32c(2);
+        let c3 = s.m.i32c(3);
+        let c7 = s.m.i32c(7);
+        let c4 = s.m.i32c(4);
+
+        // Read-before-write on slot 2 -> 0; store + same-block load->store forwarding (slot 0 -> slot 1).
+        let g2_init = s.m.gep(scratch, &[c0, c2]);
+        let unread = s.m.load(g2_init, 4);
+        let g0 = s.m.gep(scratch, &[c0, c0]);
+        s.m.store(g0, lane, 4);
+        let fwd = s.m.load(g0, 4);
+        let g1 = s.m.gep(scratch, &[c0, c1]);
+        s.m.store(g1, fwd, 4);
+
+        let b_then = s.m.new_block();
+        let b_else = s.m.new_block();
+        let b_join = s.m.new_block();
+        let b_loop = s.m.new_block();
+        let b_dup = s.m.new_block();
+        let b_exit = s.m.new_block();
+
+        let is_even = s.m.bin(BinOp::And, lane, c1);
+        let cond = s.m.cmp(Pred::Eq, is_even, c0);
+        s.m.cond_br(cond, b_then, b_else);
+
+        // Only `then` writes slot 3; `else` leaves it at entry 0.
+        s.m.set_block(b_then);
+        let g3_t = s.m.gep(scratch, &[c0, c3]);
+        s.m.store(g3_t, c7, 4);
+        s.m.br(b_join);
+
+        s.m.set_block(b_else);
+        s.m.br(b_join);
+
+        // `join` feeds an existing phi from a promoted load across edges and loops on slot 0.
+        s.m.set_block(b_join);
+        let g3_j = s.m.gep(scratch, &[c0, c3]);
+        let v3 = s.m.load(g3_j, 4);
+        let g1_j = s.m.gep(scratch, &[c0, c1]);
+        let v1 = s.m.load(g1_j, 4);
+        let sum0 = s.m.bin(BinOp::Add, v3, v1);
+        s.m.br(b_loop);
+
+        s.m.set_block(b_loop);
+        let iv = s.m.phi(i32t);
+        s.m.add_incoming(iv, c0, b_join);
+        let g0_l = s.m.gep(scratch, &[c0, c0]);
+        let cur0 = s.m.load(g0_l, 4);
+        let next0 = s.m.bin(BinOp::Add, cur0, c1);
+        s.m.store(g0_l, next0, 4);
+        let iv_next = s.m.bin(BinOp::Add, iv, c1);
+        s.m.add_incoming(iv, iv_next, b_loop);
+        let again = s.m.cmp(Pred::ULt, iv_next, c4);
+        s.m.cond_br(again, b_loop, b_dup);
+
+        // Multi-edge `CondBr(_, b_exit, b_exit)` after a store in `b_dup`.
+        s.m.set_block(b_dup);
+        let g2_d = s.m.gep(scratch, &[c0, c2]);
+        let res_d = s.m.bin(BinOp::Add, unread, sum0);
+        s.m.store(g2_d, res_d, 4);
+        s.m.cond_br(cond, b_exit, b_exit);
+
+        s.m.set_block(b_exit);
+        let g0_e = s.m.gep(scratch, &[c0, c0]);
+        let g2_e = s.m.gep(scratch, &[c0, c2]);
+        let out0 = s.m.load(g0_e, 4);
+        let out2 = s.m.load(g2_e, 4);
+        let total = s.m.bin(BinOp::Add, out0, out2);
+        let byte_off = s.m.bin(BinOp::Shl, lane, c2);
+        s.raw_store(mem, byte_off, &[total]);
+        s.m.ret();
+
+        let dxil = s.try_finish([32, 1, 1], Some(32)).expect("validates after SROA");
+        validate::validate(&dxil).expect("dxil.dll validates promoted shader");
+        let dis = validate::disassemble(&dxil).unwrap();
+        assert!(!dis.contains("alloca"), "alloca must be eliminated:\n{dis}");
+        assert!(!dis.contains("load "), "scratch loads must be eliminated:\n{dis}");
+        assert!(!dis.contains("store "), "scratch stores must be eliminated:\n{dis}");
+    }
+
+    #[test]
+    fn sroa_skips_mixed_dynamic_escaping_oob_and_scalar_allocas() {
+        let mut m = Module::new();
+        m.define_entry("main");
+        let entry = m.entry_block();
+        m.set_block(entry);
+        let i32t = m.i32();
+        let arr_t = m.array(8, i32t);
+        let c0 = m.i32c(0);
+        let c1 = m.i32c(1);
+        let c8 = m.i32c(8);
+        let dyn_ty = m.func_ty(i32t, &[]);
+        let dyn_fn = m.declare("dx.op.waveGetLaneIndex", dyn_ty, FnAttrs::ReadNone);
+        let dyn_idx = m.call(dyn_fn, &[]);
+        let void = m.void();
+        let sink_ty = m.func_ty(void, &[i32t]);
+        let sink = m.declare("dx.op.storeOutput.i32", sink_ty, FnAttrs::NoUnwind);
+
+        // 1. Mixed static + dynamic GEP -> must NOT promote.
+        let a_mixed = m.alloca(arr_t, 4);
+        let g_st = m.gep(a_mixed, &[c0, c0]);
+        m.store(g_st, c1, 4);
+        let g_dyn = m.gep(a_mixed, &[c0, dyn_idx]);
+        let v_dyn = m.load(g_dyn, 4);
+
+        // 2. Escaping pointer (GEP stored into another slot) -> must NOT promote.
+        let a_esc = m.alloca(arr_t, 4);
+        let ptr_ty = m.ptr(i32t, 0);
+        let p_slot = m.alloca(ptr_ty, 4);
+        let g_esc = m.gep(a_esc, &[c0, c0]);
+        m.store(g_esc, c1, 4);
+        m.store(p_slot, g_esc, 4);
+        let esc_loaded = m.load(p_slot, 4);
+        let v_esc = m.load(esc_loaded, 4);
+
+        // 3. Out-of-bounds constant slot (`slot == 8` on `[8 x i32]`) -> must NOT promote.
+        let a_oob = m.alloca(arr_t, 4);
+        let g_oob = m.gep(a_oob, &[c0, c8]);
+        m.store(g_oob, c1, 4);
+        let v_oob = m.load(g_oob, 4);
+
+        // 4. Scalar `alloca(i32)` (`Init::slot` pattern) -> must NOT promote.
+        let a_scalar = m.alloca(i32t, 4);
+        m.store(a_scalar, c1, 4);
+        let v_scalar = m.load(a_scalar, 4);
+
+        let sum = m.bin(BinOp::Add, v_dyn, v_esc);
+        let sum = m.bin(BinOp::Add, sum, v_oob);
+        let sum = m.bin(BinOp::Add, sum, v_scalar);
+        m.call(sink, &[sum]);
+        m.ret();
+        m.optimize();
+
+        assert_eq!(count_ops(&m, |op| matches!(op, Op::Alloca(..))), 5);
+        let order: Vec<u32> = m.block_layout().0.into_iter().map(|b| b as u32).collect();
+        assert!(m.uses_well_formed(&order));
+    }
+
+    #[test]
+    fn sroa_backedge_load_into_existing_phi_and_mixed_allocas() {
+        let mut m = Module::new();
+        m.define_entry("main");
+        let entry = m.entry_block();
+        let loop_b = m.new_block();
+        let exit = m.new_block();
+        let i32t = m.i32();
+        let arr_t = m.array(4, i32t);
+        let c0 = m.i32c(0);
+        let c1 = m.i32c(1);
+        let c4 = m.i32c(4);
+        let dyn_ty = m.func_ty(i32t, &[]);
+        let dyn_fn = m.declare("dx.op.waveGetLaneIndex", dyn_ty, FnAttrs::ReadNone);
+        let void = m.void();
+        let sink_ty = m.func_ty(void, &[i32t]);
+        let sink = m.declare("dx.op.storeOutput.i32", sink_ty, FnAttrs::NoUnwind);
+
+        m.set_block(entry);
+        let a_stat = m.alloca(arr_t, 4);
+        let a_dyn = m.alloca(arr_t, 4);
+        let lane = m.call(dyn_fn, &[]);
+        let g_stat = m.gep(a_stat, &[c0, c1]);
+        let g_dyn = m.gep(a_dyn, &[c0, lane]);
+        m.store(g_stat, c1, 4);
+        m.store(g_dyn, lane, 4);
+        m.br(loop_b);
+
+        m.set_block(loop_b);
+        let acc = m.phi(i32t);
+        m.add_incoming(acc, c0, entry);
+        let next_s = m.bin(BinOp::Add, acc, c1);
+        m.store(g_stat, next_s, 4);
+        let back = m.load(g_stat, 4);
+        m.add_incoming(acc, back, loop_b);
+        let cont = m.cmp(Pred::ULt, back, c4);
+        m.cond_br(cont, loop_b, exit);
+
+        m.set_block(exit);
+        let v_dyn = m.load(g_dyn, 4);
+        let res = m.bin(BinOp::Add, back, v_dyn);
+        m.call(sink, &[res]);
+        m.ret();
+
+        m.optimize();
+        // Static alloca is eliminated while dynamic alloca stays intact.
+        assert_eq!(count_ops(&m, |op| matches!(op, Op::Alloca(..))), 1);
+        let Value::Inst(back_i) = back else { unreachable!() };
+        let Value::Inst(acc_i) = acc else { unreachable!() };
+        if let Op::Phi(inc) = &m.insts[acc_i as usize].op {
+            assert!(inc.iter().all(|&(v, _)| v != Value::Inst(back_i)));
+        }
         let order: Vec<u32> = m.block_layout().0.into_iter().map(|b| b as u32).collect();
         assert!(m.uses_well_formed(&order));
     }
