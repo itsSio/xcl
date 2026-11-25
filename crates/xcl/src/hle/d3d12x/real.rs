@@ -4027,9 +4027,9 @@ fn compile_slots(bytes: usize) -> &'static Slots {
     if bytes >= GIANT_DRIVER_COMPILE { &GIANT_COMPILES } else { &BIG_COMPILES }
 }
 
-/// A driver compile of `bytes` of DXIL through `build`: a huge one on an `xcl-pso*` worker
-/// waits for its slot first (`big_compile_turn`; not a title thread's, nor one the title waits
-/// for). Logs its time, size and whether it was gated.
+/// A driver compile of `bytes` of DXIL through `build`: a huge one waits for its slot first
+/// (`big_compile_turn`; wanted when on a title thread or awaited by one). Logs its time, size
+/// and whether it was gated.
 fn driver_compile<R>(kind: &str, bytes: usize, gate: bool, build: impl FnOnce() -> R) -> R {
     driver_compile_identified(kind, bytes, gate, None, build).0
 }
@@ -4044,9 +4044,9 @@ fn pso_trace() -> bool {
 /// `[SHADER]` lines and `xcl shaders --measure-pso`) and whether a driver blob was supplied.
 /// Also returns the time spent in the driver alone (not waiting for a slot).
 fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Option<(u64, bool)>, build: impl FnOnce() -> R) -> (R, std::time::Duration) {
-    let huge = gate && bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
+    let huge = gate && bytes >= huge_pso_bytes();
     let waited = std::time::Instant::now();
-    let _slot = huge.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted));
+    let _slot = huge.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::wanted_compile));
     let waited = waited.elapsed();
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
@@ -4071,7 +4071,7 @@ fn gate_note(huge_size: bool, gated: bool, waited: std::time::Duration) -> Strin
     match (huge_size, gated) {
         (false, _) => String::new(),
         (true, true) => format!(", gated (waited {} ms)", waited.as_millis()),
-        (true, false) => ", huge, ungated here (a title thread's, cached, or gated by its caller)".to_string(),
+        (true, false) => ", huge, ungated here (cached or gated by its caller)".to_string(),
     }
 }
 
@@ -4262,24 +4262,112 @@ mod big_compile_tests {
         assert_eq!(*S.n.lock().unwrap(), 0);
     }
 
+    static GLOBAL_SLOTS_TEST: Mutex<()> = Mutex::new(());
+
     #[test]
-    fn small_and_title_thread_compiles_bypass_the_gate() {
-        // every slot taken: a small compile on a worker, and a huge one on an unnamed (title)
-        // thread, both go on at once
-        // (both lanes: a huge compile of any size would block on a gate it should bypass)
-        let mut held: Vec<_> = (0..huge_pso_concurrency()).map(|_| big_compile_turn(&BIG_COMPILES, || true, || false)).collect();
-        held.push(big_compile_turn(&GIANT_COMPILES, || true, || false));
-        let small = std::thread::Builder::new()
+    fn small_and_cached_compiles_bypass_the_gate() {
+        // Every wanted slot taken in both lanes: small (< huge_pso_bytes()) and cached
+        // (gate = false) compiles on both xcl-pso-* workers and unnamed title threads still
+        // bypass BIG_COMPILES and GIANT_COMPILES.
+        let _lock = GLOBAL_SLOTS_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let mut held: Vec<_> = (0..BIG_COMPILES.wanted_most()).map(|_| big_compile_turn(&BIG_COMPILES, || true, || true)).collect();
+        held.push(big_compile_turn(&GIANT_COMPILES, || true, || true));
+        let t0 = Instant::now();
+        let small_worker = std::thread::Builder::new()
             .name("xcl-pso-test".into())
             .spawn(|| driver_compile("test", huge_pso_bytes() - 1, true, || 7))
             .unwrap();
-        let t0 = Instant::now();
-        assert_eq!(small.join().unwrap(), 7);
-        let big = huge_pso_bytes().max(GIANT_DRIVER_COMPILE - 1);
-        assert_eq!(std::thread::spawn(move || driver_compile("test", big, true, || 8)).join().unwrap(), 8);
-        assert_eq!(std::thread::spawn(|| driver_compile("test", usize::MAX / 2, true, || 8)).join().unwrap(), 8);
+        let cached_worker = std::thread::Builder::new()
+            .name("xcl-pso-test".into())
+            .spawn(|| driver_compile("test", GIANT_DRIVER_COMPILE, false, || 8))
+            .unwrap();
+        let small_title = std::thread::spawn(|| driver_compile("test", huge_pso_bytes() - 1, true, || 9));
+        let cached_title = std::thread::spawn(|| driver_compile("test", GIANT_DRIVER_COMPILE, false, || 10));
+        assert_eq!(small_worker.join().unwrap(), 7);
+        assert_eq!(cached_worker.join().unwrap(), 8);
+        assert_eq!(small_title.join().unwrap(), 9);
+        assert_eq!(cached_title.join().unwrap(), 10);
         assert!(t0.elapsed() < Duration::from_secs(2));
         drop(held);
+    }
+
+    #[test]
+    fn title_thread_huge_and_giant_compiles_are_gated_and_capped() {
+        use std::sync::atomic::AtomicUsize;
+        let _lock = GLOBAL_SLOTS_TEST.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Cold huge compile on an unnamed title thread waits when BIG_COMPILES.wanted_most() is full.
+        let big = huge_pso_bytes().min(GIANT_DRIVER_COMPILE - 1);
+        let mut held: Vec<_> = (0..BIG_COMPILES.wanted_most()).map(|_| big_compile_turn(&BIG_COMPILES, || true, || true)).collect();
+        let huge_t = std::thread::spawn(move || driver_compile("test", big, true, || 11));
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(!huge_t.is_finished(), "title-thread huge compile must obey BIG_COMPILES.wanted_most()");
+        held.pop();
+        assert_eq!(huge_t.join().unwrap(), 11);
+        drop(held);
+
+        // A burst of unnamed-thread cold huge compiles never exceeds BIG_COMPILES.wanted_most().
+        static BIG_IN: AtomicUsize = AtomicUsize::new(0);
+        static BIG_PEAK: AtomicUsize = AtomicUsize::new(0);
+        let big_cap = BIG_COMPILES.wanted_most();
+        let big_burst: Vec<_> = (0..(big_cap + 4))
+            .map(|_| {
+                std::thread::spawn(move || {
+                    driver_compile("test", big, true, || {
+                        let now = BIG_IN.fetch_add(1, Ordering::SeqCst) + 1;
+                        BIG_PEAK.fetch_max(now, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(20));
+                        BIG_IN.fetch_sub(1, Ordering::SeqCst);
+                    });
+                })
+            })
+            .collect();
+        big_burst.into_iter().for_each(|h| h.join().unwrap());
+        let big_peak = BIG_PEAK.load(Ordering::SeqCst);
+        assert!(big_peak >= 1 && big_peak <= big_cap, "peak {big_peak} exceeded BIG_COMPILES.wanted_most() {big_cap}");
+
+        // Cold giant compile on an unnamed title thread waits when GIANT_COMPILES.wanted_most() is full.
+        let held_giant = big_compile_turn(&GIANT_COMPILES, || true, || true);
+        let giant_t = std::thread::spawn(|| driver_compile("test", GIANT_DRIVER_COMPILE, true, || 12));
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(!giant_t.is_finished(), "title-thread giant compile must obey GIANT_COMPILES.wanted_most()");
+        drop(held_giant);
+        assert_eq!(giant_t.join().unwrap(), 12);
+
+        // A burst of unnamed-thread cold giant compiles never exceeds GIANT_COMPILES.wanted_most() (1).
+        static GIANT_IN: AtomicUsize = AtomicUsize::new(0);
+        static GIANT_PEAK: AtomicUsize = AtomicUsize::new(0);
+        let giant_cap = GIANT_COMPILES.wanted_most();
+        let giant_burst: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    driver_compile("test", GIANT_DRIVER_COMPILE, true, || {
+                        let now = GIANT_IN.fetch_add(1, Ordering::SeqCst) + 1;
+                        GIANT_PEAK.fetch_max(now, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(20));
+                        GIANT_IN.fetch_sub(1, Ordering::SeqCst);
+                    });
+                })
+            })
+            .collect();
+        giant_burst.into_iter().for_each(|h| h.join().unwrap());
+        assert_eq!(GIANT_PEAK.load(Ordering::SeqCst), giant_cap, "title-thread giant compiles must respect GIANT_COMPILES.wanted_most()");
+    }
+
+    #[test]
+    fn title_thread_compile_is_wanted_and_bypasses_commit_wait() {
+        assert!(super::super::pso_async::wanted_compile());
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 2 };
+        let unwanted = big_compile_turn(&S, || true, || false);
+        let t0 = Instant::now();
+        let title = std::thread::spawn(|| {
+            assert!(super::super::pso_async::wanted_compile());
+            let _g = big_compile_turn(&S, || false, super::super::pso_async::wanted_compile);
+            13
+        });
+        assert_eq!(title.join().unwrap(), 13);
+        assert!(t0.elapsed() < Duration::from_secs(2), "title thread must bypass background commit wait");
+        drop(unwanted);
     }
 
     #[test]
@@ -5920,9 +6008,9 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let desc: [usize; 2] = [stream.0.len(), stream.0.as_ptr() as usize];
     // the mesh pass and its compute pass: one turn for both
     let bytes = stream.shader_bytes() + tp.cs.len();
-    let gate = bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
+    let gate = bytes >= huge_pso_bytes();
     let waited = std::time::Instant::now();
-    let _slot = gate.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted));
+    let _slot = gate.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::wanted_compile));
     if gate {
         crate::xlog_info!("D3D12.X: two-pass {kind} PSO ({bytes} B DXIL) gated, waited {} ms", waited.elapsed().as_millis());
     }
