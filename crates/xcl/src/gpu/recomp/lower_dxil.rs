@@ -1166,4 +1166,64 @@ mod tests {
             }
         }
     }
+
+    /// Constant-offset RDNA2 scratch instructions (dword, byte/short sub-dword, cross-dword
+    /// unaligned RMW, read-before-write, branch) eliminate `alloca` and match HLSL on GPU.
+    #[test]
+    fn static_scratch_eliminates_alloca_and_matches_hlsl_on_gpu() {
+        let mk = |w64: bool| -> Vec<I> {
+            let (save, or) = if w64 { ("S_AND_SAVEEXEC_B64", "S_OR_B64") } else { ("S_AND_SAVEEXEC_B32", "S_OR_B32") };
+            vec![
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 128)]), // v2 = 0 (constant addr)
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V)]),   // v1 = lane
+                ("SCRATCH_STORE_DWORD", "ENC_FLAT_SCRATCH", &[("ADDR", 2), ("DATA", 1), ("SADDR", 0x7D), ("OFFSET", 0)]),
+                ("SCRATCH_STORE_BYTE", "ENC_FLAT_SCRATCH", &[("ADDR", 2), ("DATA", 1), ("SADDR", 0x7D), ("OFFSET", 5)]),
+                ("SCRATCH_STORE_SHORT", "ENC_FLAT_SCRATCH", &[("ADDR", 2), ("DATA", 1), ("SADDR", 0x7D), ("OFFSET", 7)]),
+                ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 138), ("VSRC1", 0)]),
+                (save, "ENC_SOP1", &[("SDST", 4), ("SSRC0", 106)]),
+                ("SCRATCH_STORE_DWORD", "ENC_FLAT_SCRATCH", &[("ADDR", 2), ("DATA", 1), ("SADDR", 0x7D), ("OFFSET", 16)]),
+                (or, "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 4)]),
+                ("SCRATCH_LOAD_DWORD", "ENC_FLAT_SCRATCH", &[("VDST", 3), ("ADDR", 2), ("SADDR", 0x7D), ("OFFSET", 0)]),
+                ("SCRATCH_LOAD_DWORD", "ENC_FLAT_SCRATCH", &[("VDST", 4), ("ADDR", 2), ("SADDR", 0x7D), ("OFFSET", 4)]),
+                ("SCRATCH_LOAD_USHORT", "ENC_FLAT_SCRATCH", &[("VDST", 5), ("ADDR", 2), ("SADDR", 0x7D), ("OFFSET", 7)]),
+                ("SCRATCH_LOAD_DWORD", "ENC_FLAT_SCRATCH", &[("VDST", 6), ("ADDR", 2), ("SADDR", 0x7D), ("OFFSET", 16)]),
+                ("SCRATCH_LOAD_DWORD", "ENC_FLAT_SCRATCH", &[("VDST", 7), ("ADDR", 2), ("SADDR", 0x7D), ("OFFSET", 24)]),
+                ENDPGM,
+            ]
+        };
+        let (dxil32, _) = super::kernel(&decode(&mk(false)), false).unwrap_or_else(|e| panic!("wave32: {e}"));
+        if dxc::location().is_ok() {
+            let dis = crate::gpu::dxil::validate::disassemble(&dxil32).unwrap();
+            assert!(!dis.contains("alloca"), "static scratch alloca must be eliminated:\n{dis}");
+        }
+        if !gpu() || dxc::location().is_err() {
+            return;
+        }
+        let wave64_ok = runner::wave64_supported() == Ok(true);
+        for w64 in [false, true] {
+            if w64 && !wave64_ok {
+                runner::skip_test("static_scratch, wave64: no wave64");
+                continue;
+            }
+            let lines = mk(w64);
+            let lanes = if w64 { 64 } else { 32 };
+            let (s, v) = state(lanes);
+            let mut st = runner::KernelState::default();
+            st.sgpr.copy_from_slice(&s);
+            for (l, regs) in v.iter().enumerate() {
+                st.vgpr[l][..regs.len()].copy_from_slice(regs);
+            }
+            let bytes: Vec<u8> = lines.iter().flat_map(encode_line).collect();
+            let t = translate(&bytes, &Options { wave64: w64, ..Default::default() }).unwrap();
+            assert!(t.complete(), "{:?}", t.unsupported_why);
+            let hlsl = runner::run(&dxc::compile(&t.hlsl, "main", "cs_6_6", &["-Gis"]).unwrap(), &st, &[]).unwrap();
+            let (dxil, _) = super::kernel(&decode(&lines), w64).unwrap();
+            let direct = runner::run(&dxil, &st, &[]).unwrap();
+            for l in 0..lanes {
+                for r in 3..=7 {
+                    assert_eq!(direct.vgpr[l][r], hlsl.vgpr[l][r], "wave{lanes} lane {l} v{r}");
+                }
+            }
+        }
+    }
 }
