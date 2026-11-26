@@ -32,6 +32,25 @@ impl Screen {
 
 pub(super) fn active() -> bool { ACTIVE.load(Ordering::Acquire) }
 
+/// The process's current folder set to `dir` until this is dropped, then the one before it.
+struct InFolder(Option<std::path::PathBuf>);
+
+impl InFolder {
+    fn enter(dir: &std::path::Path) -> InFolder {
+        let before = std::env::current_dir().ok();
+        let _ = std::fs::create_dir_all(dir);
+        InFolder(before.filter(|_| std::env::set_current_dir(dir).is_ok()))
+    }
+}
+
+impl Drop for InFolder {
+    fn drop(&mut self) {
+        if let Some(dir) = &self.0 {
+            let _ = std::env::set_current_dir(dir);
+        }
+    }
+}
+
 pub(crate) fn before_guest(boot: &Boot) -> Result<(), String> {
     // This handle was opened by the launcher on itself, then inherited by this host.
     let parent = std::env::var("XCL_PREPARATION_PARENT").ok()
@@ -64,6 +83,11 @@ pub(crate) fn before_guest(boot: &Boot) -> Result<(), String> {
         crate::xlog_info!("Shader preparation window {:#x}", hwnd.0 as usize);
         Some(hwnd)
     } else { None };
+    // The current folder is the game folder, and the VFS that sends writes there to the overlay
+    // is not installed yet: a driver that writes its own folders under it when a device opens
+    // (`NVIDIA Corporation\umdlogs` on an RTX 5080) would change the game. The preparation and
+    // its worker processes run in XCL's data folder; the title gets the game folder back.
+    let _folder = InFolder::enter(&boot.data_dir);
     let result = std::thread::scope(|scope| {
         let worker = scope.spawn(|| prepare_for_launch(root, &progress));
         // (a line every 5 s: a log that stands still for long reads as a frozen process)
@@ -257,5 +281,60 @@ mod tests {
         assert_eq!(percent(1, 4, false), 25);
         assert_eq!(percent(4, 4, false), 99);
         assert_eq!(percent(4, 4, true), 100);
+    }
+
+    #[test]
+    fn in_folder_switches_cwd_and_restores_on_drop_and_unwind() {
+        const CHILD: &str = "XCL_TEST_IN_FOLDER_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::d3d12x::present::preparation::tests::in_folder_switches_cwd_and_restores_on_drop_and_unwind", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        struct TempDir(std::path::PathBuf);
+        impl Drop for TempDir {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        struct RestoreCwd(std::path::PathBuf);
+        impl Drop for RestoreCwd {
+            fn drop(&mut self) { let _ = std::env::set_current_dir(&self.0); }
+        }
+
+        let orig = std::env::current_dir().unwrap();
+        let root = TempDir(std::env::temp_dir().join(format!("xcl-in-folder-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&root.0);
+        let _restore = RestoreCwd(orig.clone());
+        let target = root.0.join("nested").join("data");
+        let canon_orig = std::fs::canonicalize(&orig).unwrap();
+
+        // Normal drop creates the target, enters it, and restores the original folder.
+        {
+            let _folder = InFolder::enter(&target);
+            let canon_target = std::fs::canonicalize(&target).unwrap();
+            assert_ne!(canon_target, canon_orig);
+            assert_eq!(std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap(), canon_target);
+        }
+        assert_eq!(std::env::current_dir().unwrap(), orig);
+
+        // Panic unwind still restores the original folder via InFolder's Drop.
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _folder = InFolder::enter(&target);
+            assert_eq!(
+                std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap(),
+                std::fs::canonicalize(&target).unwrap()
+            );
+            panic!("simulated preparation panic");
+        }));
+        assert!(res.is_err());
+        assert_eq!(std::env::current_dir().unwrap(), orig);
     }
 }
