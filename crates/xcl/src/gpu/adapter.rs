@@ -121,6 +121,17 @@ pub fn name(desc: &DXGI_ADAPTER_DESC1) -> String {
     String::from_utf16_lossy(&desc.Description[..n])
 }
 
+/// Microsoft Basic Render Driver (WARP) PCI IDs. On headless Windows Server VMs (such as
+/// GitHub Actions `windows-2025`), DXGI can report it without `DXGI_ADAPTER_FLAG_SOFTWARE`.
+const MICROSOFT_VENDOR_ID: u32 = 0x1414;
+const BASIC_RENDER_DRIVER_DEVICE_ID: u32 = 0x008c;
+
+/// Whether `desc` is a software renderer (WARP / Microsoft Basic Render Driver).
+pub fn is_software(desc: &DXGI_ADAPTER_DESC1) -> bool {
+    desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
+        || (desc.VendorId == MICROSOFT_VENDOR_ID && desc.DeviceId == BASIC_RENDER_DRIVER_DEVICE_ID)
+}
+
 /// The hardware adapters (software ones skipped) in high-performance order.
 pub fn hardware(factory: &IDXGIFactory6) -> Vec<(IDXGIAdapter1, DXGI_ADAPTER_DESC1)> {
     let mut out = Vec::new();
@@ -129,7 +140,7 @@ pub fn hardware(factory: &IDXGIFactory6) -> Vec<(IDXGIAdapter1, DXGI_ADAPTER_DES
         while let Ok(adapter) = factory.EnumAdapterByGpuPreference::<IDXGIAdapter1>(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE) {
             i += 1;
             let Ok(desc) = adapter.GetDesc1() else { continue };
-            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+            if is_software(&desc) {
                 continue;
             }
             out.push((adapter, desc));

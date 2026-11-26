@@ -2098,7 +2098,7 @@ mod tests {
         unsafe {
             let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
             let Ok(adapter) = factory.EnumAdapters1(0) else { return };
-            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+            if adapter.GetDesc1().is_ok_and(|d| crate::gpu::adapter::is_software(&d)) {
                 return;
             }
             let mut dev: Option<ID3D12Device> = None;

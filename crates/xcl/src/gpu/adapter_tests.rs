@@ -1,4 +1,6 @@
-use super::{select_indices, Selector};
+use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory4, DXGI_ADAPTER_DESC1, DXGI_ADAPTER_FLAG_SOFTWARE};
+
+use super::{is_software, select_indices, Selector};
 
 #[test]
 fn selector_parsing() {
@@ -52,4 +54,31 @@ fn numeric_selector_falls_back_to_model_token_when_out_of_range() {
     assert!(select_indices(&two, &Selector::parse("208")).is_empty());
     assert!(select_indices(&two, &Selector::parse("80")).is_empty());
     assert_eq!(select_indices(&two, &Selector::parse("2080")), vec![0]);
+}
+
+#[test]
+fn microsoft_basic_render_driver_without_software_flag_is_still_software() {
+    let flagged = DXGI_ADAPTER_DESC1 { Flags: DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32, ..Default::default() };
+    assert!(is_software(&flagged));
+
+    // Headless Windows Server VMs (e.g. windows-2025 CI) report Microsoft Basic Render Driver
+    // with Flags == 0, VendorId 0x1414, DeviceId 0x008c.
+    let unflagged_basic = DXGI_ADAPTER_DESC1 { VendorId: 0x1414, DeviceId: 0x008c, Flags: 0, ..Default::default() };
+    assert!(is_software(&unflagged_basic));
+
+    let nvidia = DXGI_ADAPTER_DESC1 { VendorId: 0x10de, DeviceId: 0x2c02, Flags: 0, ..Default::default() };
+    let amd = DXGI_ADAPTER_DESC1 { VendorId: 0x1002, DeviceId: 0x744c, Flags: 0, ..Default::default() };
+    let other_ms = DXGI_ADAPTER_DESC1 { VendorId: 0x1414, DeviceId: 0x0001, Flags: 0, ..Default::default() };
+    assert!(!is_software(&nvidia));
+    assert!(!is_software(&amd));
+    assert!(!is_software(&other_ms));
+
+    unsafe {
+        if let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() {
+            if let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter1>() {
+                let desc = warp.GetDesc1().expect("WARP GetDesc1");
+                assert!(is_software(&desc));
+            }
+        }
+    }
 }

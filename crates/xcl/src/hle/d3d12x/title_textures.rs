@@ -3773,7 +3773,7 @@ pub(super) mod tests {
                 println!("SKIPPED placed_title_textures_share_vram_and_preserve_pixels: no adapter");
                 return;
             };
-            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+            if adapter.GetDesc1().is_ok_and(|d| crate::gpu::adapter::is_software(&d)) {
                 println!("SKIPPED placed_title_textures_share_vram_and_preserve_pixels: software adapter");
                 return;
             }
@@ -4455,7 +4455,7 @@ pub(super) mod tests {
         unsafe {
             let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
             let Ok(adapter) = factory.EnumAdapters1(0) else { return println!("SKIPPED {NAME}: no adapter") };
-            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+            if adapter.GetDesc1().is_ok_and(|d| crate::gpu::adapter::is_software(&d)) {
                 return println!("SKIPPED {NAME}: software adapter");
             }
             let mut dev: Option<ID3D12Device> = None;

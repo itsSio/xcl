@@ -4395,7 +4395,7 @@ mod tests {
         use windows::Win32::Graphics::Dxgi::*;
         let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else { return false };
         let adapter: windows::core::Result<IDXGIAdapter1> = factory.EnumAdapterByLuid(dev.GetAdapterLuid());
-        adapter.and_then(|a| a.GetDesc1()).is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
+        adapter.and_then(|a| a.GetDesc1()).is_ok_and(|d| crate::gpu::adapter::is_software(&d))
     }
 
     /// The small ones of an upload's runs go up in dispatches: each lands where it belongs (far
