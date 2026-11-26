@@ -1465,6 +1465,9 @@ pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> B
                 known.insert(r, v);
             }
         }
+        if d.inst.flags & rdna2::F_INDIRECT != 0 && rdna2::branch_target(d).is_none() {
+            known.clear();
+        }
     }
     out
 }

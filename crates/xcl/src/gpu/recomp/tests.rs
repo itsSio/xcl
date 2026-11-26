@@ -3143,6 +3143,29 @@ fn gpu_static_sampler_word_from_s_brev() {
     }
 }
 
+/// An indirect call (`s_swappc_b64` through registers) can overwrite any SGPR before
+/// returning, so S# words set before it must not be treated as constants after it.
+#[test]
+fn an_s_word_set_before_a_call_to_unknown_code_is_no_constant_after_it() {
+    let code = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 24), ("SSRC0", 128)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 25), ("SSRC0", 128)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 26), ("SSRC0", 128)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 27), ("SSRC0", 128)], None),
+        ("S_SWAPPC_B64", "ENC_SOP1", &[("SDST", 30), ("SSRC0", 40)], None),
+        ("IMAGE_SAMPLE_LZ", "ENC_MIMG", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 1)], None),
+    ]);
+    let mut insts = Vec::new();
+    let mut off = 0usize;
+    while off + 4 <= code.len() {
+        let d = crate::gpu::rdna2::decode(&code[off..], off as u64).unwrap();
+        off += d.len;
+        insts.push(d);
+    }
+    let leaders = std::collections::BTreeSet::from([0]);
+    assert!(super::constant_samplers(&insts, &leaders).is_empty());
+}
+
 #[test]
 fn gpu_images_a16_d16() {
     if !gpu_ready() {
