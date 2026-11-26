@@ -2,8 +2,9 @@
 //! (`d3d12x::real::dev_create_pipeline_state` / `translated_mesh_stream`), with no game data.
 //!
 //! Runs on any D3D12 adapter (AMD, NVIDIA, Intel, or WARP) with zero vendor-specific skips:
-//! 1. Synthetic console MS placed in the AS slot with no MS slot is refused cleanly with
-//!    `E_INVALIDARG` and records the `"in the AS slot – refused"` error.
+//! 1. Synthetic console MS placed in the AS slot with no MS slot is taken as the mesh shader it
+//!    is (`real::mesh_shader_slots`) and, having no NGG variant, fails cleanly with
+//!    `E_INVALIDARG` as an MS translation error, not as an AS-slot refusal.
 //! 2. Synthetic console MS paired with an AS subobject is refused cleanly with `E_INVALIDARG`.
 //! 3. Empty, truncated, unknown-subobject, and unreadable-shader pipeline streams fail cleanly
 //!    without panicking or crashing.
@@ -93,10 +94,11 @@ fn console_ms_in_as_slot_and_ms_with_as_are_refused_cleanly() {
     };
     let err = unsafe { d2.CreatePipelineState::<ID3D12PipelineState>(&desc) }.expect_err("MS in AS slot must be refused");
     assert_eq!(err.code(), E_INVALIDARG);
+    // translated as the MS (the synthetic container has no NGG variant), not refused for the slot
+    let errors = real::stats().translation_errors;
     assert!(
-        real::stats().translation_errors.iter().any(|e| e.contains("in the AS slot")),
-        "expected AS-slot refusal in translation_errors: {:?}",
-        real::stats().translation_errors
+        errors.iter().any(|e| e.starts_with("MS: ")) && !errors.iter().any(|e| e.contains("in the AS slot")),
+        "expected an MS translation error and no AS-slot refusal in translation_errors: {errors:?}"
     );
 
     // Case 2: console MS paired with an AS subobject

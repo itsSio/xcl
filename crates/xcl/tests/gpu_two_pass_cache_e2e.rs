@@ -646,6 +646,12 @@ float4 main(V v) : SV_Target0 { return v.p0; }
     assert_eq!(draw_two_pass_and_read(&dev, &gs, 1, true), [0.0, 1.0, 0.0, 1.0]);
     assert_eq!(real::two_pass_count(), before + 3);
     drop((ms1, ms2, gs));
+    // (the real pipelines behind the stand-ins go once the queues are past a fence:
+    // `late_release::hold_pipeline`, not in the drop)
+    let start = std::time::Instant::now();
+    while real::two_pass_count() != before && start.elapsed() < std::time::Duration::from_secs(10) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     assert_eq!(real::two_pass_count(), before, "releasing the title PSOs releases their two-pass state");
 
     if dev.cast::<ID3D12InfoQueue>().is_ok() {
