@@ -1523,6 +1523,10 @@ pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>, foll
                     known.insert(r, v);
                 }
             }
+            // a call or jump through registers to code that is not known can write any SGPR
+            if d.inst.flags & rdna2::F_INDIRECT != 0 && rdna2::branch_target(d).is_none() {
+                known.clear();
+            }
         }
     }
     // the blocks, in address order
@@ -1535,6 +1539,9 @@ pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>, foll
         .iter()
         .enumerate()
         .map(|(k, b)| {
+            if b.iter().any(|d| d.inst.flags & rdna2::F_INDIRECT != 0 && rdna2::branch_target(d).is_none()) {
+                return None;
+            }
             let d = b.last().unwrap();
             let after = (k + 1 < blocks.len()).then_some(k + 1);
             Some(match (rdna2::branch_target(d), d.inst.name) {

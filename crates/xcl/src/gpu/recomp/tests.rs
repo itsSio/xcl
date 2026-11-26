@@ -3167,6 +3167,61 @@ fn an_s_word_that_differs_by_the_way_in_is_no_constant() {
     assert!(t.static_samplers.is_empty(), "{:?}", t.static_samplers);
 }
 
+/// A call to code that is not known (`s_swappc_b64` through registers) can write any SGPR: an
+/// S# set before it is no constant after it, read block by block or through the branches.
+/// Before, the call counted as an instruction that writes only its return address, and the
+/// sample after it took the words set before the call as a static sampler.
+#[test]
+fn an_s_word_set_before_a_call_to_unknown_code_is_no_constant_after_it() {
+    let clamp = 2 | 2 << 3 | 2 << 6;
+    let code = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 24), ("SSRC0", 255)], Some(clamp)),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 25), ("SSRC0", 255)], Some(0x00FF_F000)),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 26), ("SSRC0", 255)], Some(0x0050_0000)),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 27), ("SSRC0", 128)], None),
+        // a call through s[40:41]; it returns to the sample through s[30:31]
+        ("S_SWAPPC_B64", "ENC_SOP1", &[("SDST", 30), ("SSRC0", 40)], None),
+        ("IMAGE_SAMPLE_LZ", "ENC_MIMG", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 1)], None),
+    ]);
+    let mut insts = Vec::new();
+    let mut off = 0;
+    while off + 4 <= code.len() {
+        let d = crate::gpu::rdna2::decode(&code[off..], off as u64).unwrap();
+        off += d.len;
+        insts.push(d);
+    }
+    let leaders = std::collections::BTreeSet::from([0]);
+    for follow in [false, true] {
+        let ss = super::constant_samplers(&insts, &leaders, follow);
+        assert!(ss.is_empty(), "follow {follow}: {ss:?}");
+    }
+}
+
+/// An indirect jump (`s_setpc_b64` through registers) mid-block can reach any block in the
+/// program, so the cross-block flow must fall back to block-by-block even when another branch
+/// ends that block (`s_setpc_b64` is not a terminator, so `translate` does not split after it).
+#[test]
+fn a_mid_block_indirect_jump_stops_cross_block_sampler_flow() {
+    let clamp = 2 | 2 << 3 | 2 << 6;
+    let code = prog(&[
+        // Block 0: mid-block indirect jump could reach Block 2, then S_BRANCH to Block 1.
+        ("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 40)], None),
+        ("S_BRANCH", "ENC_SOPP", &[("SIMM16", 0)], None),
+        // Block 1: sets s24..s27 and branches/falls into Block 2.
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 24), ("SSRC0", 255)], Some(clamp)),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 25), ("SSRC0", 255)], Some(0x00FF_F000)),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 26), ("SSRC0", 255)], Some(0x0050_0000)),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 27), ("SSRC0", 128)], None),
+        ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 0)], None),
+        // Block 2: samples with s[24:27]; must not inherit Block 1's constants because Block 0 can jump here.
+        ("IMAGE_SAMPLE_LZ", "ENC_MIMG", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 1)], None),
+        ("S_ENDPGM", "ENC_SOPP", &[], None),
+    ]);
+    let pixel = Options { mode: Mode::Pixel(crate::gpu::recomp::PsInterface::default()), ..Default::default() };
+    let t = translate(&code, &pixel).unwrap();
+    assert!(t.static_samplers.is_empty(), "{:?}", t.static_samplers);
+}
+
 /// The same program on the GPU: the texel a point sampler picks at a texel boundary.
 #[test]
 fn gpu_static_sampler_word_from_s_brev() {
