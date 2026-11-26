@@ -282,6 +282,8 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
     for a `Wait32BitValueX` / `Wait64BitValueX` that nothing satisfies (2000 ms) and the
     watchdog for a GPU queue wait (5000 ms). A value that is not a number above 0 keeps the
     default.
+  - `XCL_PAGE_TRIM_S=n`: a texture page pool heap (64 MiB) whose tiles all stayed free for `n`
+    seconds after they cooled is given back too, not kept as a warm spare. Unset or `0`: kept.
 - Translated shaders are reused across XCL rebuilds when the translator sources and DXC
   toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
 - Direct compute dispatches can split large programs into pipelines built in parallel.

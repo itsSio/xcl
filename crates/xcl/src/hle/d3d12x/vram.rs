@@ -355,6 +355,10 @@ struct TilePool {
     /// Whether heap index h has a heap (false: reclaimed by `reclaim_empty_heaps`, its slot free
     /// for the next `add_heap_at`).
     live: Vec<bool>,
+    /// Since when heap index h has had all its tiles free (`trim_empty_heaps`; None: some in use)
+    empty_since: Vec<Option<std::time::Instant>>,
+    /// Heaps given back by `trim_empty_heaps` so far
+    trimmed: u64,
 }
 
 impl TilePool {
@@ -365,6 +369,8 @@ impl TilePool {
             free_total: 0,
             cooling: std::collections::VecDeque::new(),
             live: Vec::new(),
+            empty_since: Vec::new(),
+            trimmed: 0,
         }
     }
 
@@ -374,11 +380,13 @@ impl TilePool {
             self.free_by_heap.resize_with(idx + 1, Vec::new);
             self.dirty_sort.resize(idx + 1, false);
             self.live.resize(idx + 1, false);
+            self.empty_since.resize(idx + 1, None);
         }
         debug_assert!(self.free_by_heap[idx].is_empty());
         self.free_by_heap[idx] = (0..pool_pages).rev().collect();
         self.dirty_sort[idx] = false;
         self.live[idx] = true;
+        self.empty_since[idx] = None;
         self.free_total += pool_pages as usize;
     }
 
@@ -408,6 +416,43 @@ impl TilePool {
             reclaimed.push(h as u32);
         }
         reclaimed
+    }
+
+    /// `XCL_PAGE_TRIM_S`: give back the heaps `reclaim_empty_heaps` keeps warm too once all their
+    /// tiles have been free (so cooled: `COOL` after the last went) for `after`. As there, no tile
+    /// of a heap given back is handed out after this. Returns the heap indices.
+    fn trim_empty_heaps(&mut self, after: std::time::Duration, now: std::time::Instant, pool_pages: u32) -> Vec<u32> {
+        let full = pool_pages as usize;
+        let mut trimmed = Vec::new();
+        for h in 0..self.free_by_heap.len() {
+            if !(self.live[h] && self.free_by_heap[h].len() == full) {
+                self.empty_since[h] = None;
+                continue;
+            }
+            let since = *self.empty_since[h].get_or_insert(now);
+            if now.duration_since(since) < after {
+                continue;
+            }
+            self.free_by_heap[h].clear();
+            self.free_by_heap[h].shrink_to_fit();
+            self.dirty_sort[h] = false;
+            self.live[h] = false;
+            self.empty_since[h] = None;
+            self.free_total -= full;
+            trimmed.push(h as u32);
+        }
+        self.trimmed += trimmed.len() as u64;
+        trimmed
+    }
+
+    /// The heaps to give back now: `reclaim_empty_heaps`, then with `trim` (`XCL_PAGE_TRIM_S`)
+    /// `trim_empty_heaps` of the ones it kept.
+    fn reclaim(&mut self, keep_spare: usize, trim: Option<std::time::Duration>, now: std::time::Instant, pool_pages: u32) -> Vec<u32> {
+        let mut gone = self.reclaim_empty_heaps(keep_spare, pool_pages);
+        if let Some(after) = trim {
+            gone.extend(self.trim_empty_heaps(after, now, pool_pages));
+        }
+        gone
     }
 
     fn push_cooling(&mut self, tile: Tile, now: std::time::Instant) {
@@ -500,6 +545,7 @@ impl TilePool {
                     new_h as usize
                 }
             };
+            self.empty_since[h] = None;
             if self.dirty_sort[h] {
                 self.free_by_heap[h].sort_unstable_by(|a, b| b.cmp(a));
                 self.dirty_sort[h] = false;
@@ -593,6 +639,25 @@ fn keep_spare_pools() -> usize {
     })
 }
 
+/// `XCL_PAGE_TRIM_S=n` as a duration (None: unset, 0 or not a number)
+fn parse_page_trim(v: Option<&str>) -> Option<std::time::Duration> {
+    v?.trim().parse::<u64>().ok().filter(|&s| s > 0).map(std::time::Duration::from_secs)
+}
+
+/// `XCL_PAGE_TRIM_S=n` (off by default): a pool heap all of whose tiles stayed free for `n`
+/// seconds after they cooled is given back even when it is a warm spare
+/// (`XCL_VRAM_KEEP_SPARE_POOLS`). Unset or 0: the spares are kept.
+fn page_trim() -> Option<std::time::Duration> {
+    static TRIM: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    *TRIM.get_or_init(|| {
+        let trim = parse_page_trim(std::env::var("XCL_PAGE_TRIM_S").ok().as_deref());
+        if let Some(t) = trim {
+            crate::xlog_info!("D3D12.X: XCL_PAGE_TRIM_S={} - a texture page pool heap left empty that long after its tiles cooled is given back", t.as_secs());
+        }
+        trim
+    })
+}
+
 /// The title's pages of video memory for tiled textures (see the module's comment).
 struct Pages {
     queue: ID3D12CommandQueue,
@@ -674,7 +739,7 @@ impl Pages {
     fn sweep_and_reclaim(&mut self, now: std::time::Instant) -> Vec<ID3D12Heap> {
         self.sweep(now);
         self.pool.drain_cooling(now);
-        let reclaimed_ids = self.pool.reclaim_empty_heaps(keep_spare_pools(), POOL_PAGES);
+        let reclaimed_ids = self.pool.reclaim(keep_spare_pools(), page_trim(), now, POOL_PAGES);
         let mut dropped = Vec::with_capacity(reclaimed_ids.len());
         for idx in reclaimed_ids {
             if let Some(h) = self.pools.take_heap(idx) {
@@ -684,9 +749,11 @@ impl Pages {
         if !dropped.is_empty() {
             let mb = (dropped.len() * POOL_PAGES as usize * PAGE) >> 20;
             crate::xlog_info!(
-                "D3D12.X: reclaimed {} empty 64 MiB VRAM pool heap(s) ({mb} MiB returned to GPU; {} pools active)",
+                "D3D12.X: reclaimed {} empty 64 MiB VRAM pool heap(s) ({mb} MiB returned to GPU; {} pools active, {} MiB of them free; {} trimmed so far)",
                 dropped.len(),
-                self.pools.len()
+                self.pools.len(),
+                (self.pool.free_total * PAGE) >> 20,
+                self.pool.trimmed
             );
         }
         dropped
@@ -1711,6 +1778,71 @@ mod tests {
         assert_eq!(reuse_slot.iter().filter(|&&(h, _)| h == 3).count(), 1);
         assert_eq!(next_slot.get(), 4);
         assert_eq!(free_slots.borrow().len(), 1);
+    }
+
+    /// `XCL_PAGE_TRIM_S`: the warm spare heap goes too once it stayed empty `COOL` + n after its
+    /// last tile was given back; a heap with a tile still in use stays, and off nothing more goes.
+    #[test]
+    fn tile_pool_trims_warm_spare_heaps_left_empty() {
+        const P: u32 = 64;
+        let n = Duration::from_secs(5);
+        assert_eq!(parse_page_trim(None), None);
+        assert_eq!(parse_page_trim(Some("0")), None);
+        assert_eq!(parse_page_trim(Some("x")), None);
+        assert_eq!(parse_page_trim(Some(" 5 ")), Some(n));
+        let t0 = Instant::now();
+        // two heaps filled and then all their tiles given back at t0 (`keep`: heap 1 keeps one)
+        let filled = |keep: bool| {
+            let mut pool = TilePool::new();
+            let mut next = 0u32;
+            let mut make = || {
+                next += 1;
+                Some(next - 1)
+            };
+            let a = pool.take_batch(P as usize, None, t0, P, &mut make).unwrap();
+            let b = pool.take_batch(P as usize, None, t0, P, &mut make).unwrap();
+            for &tile in a.iter().chain(&b[keep as usize..]) {
+                pool.push_cooling(tile, t0);
+            }
+            pool.drain_cooling(t0 + COOL);
+            pool
+        };
+        let t1 = t0 + COOL;
+        let t2 = t1 + n;
+
+        // on: the spare heap 0 kept by `reclaim_empty_heaps` goes after n more
+        let mut pool = filled(false);
+        assert_eq!(pool.free_total, 2 * P as usize);
+        assert_eq!(pool.reclaim(1, Some(n), t1, P), vec![1]);
+        assert_eq!(pool.reclaim(1, Some(n), t2 - Duration::from_millis(1), P), Vec::<u32>::new());
+        assert_eq!(pool.reclaim(1, Some(n), t2, P), vec![0]);
+        assert_eq!((pool.free_total, pool.trimmed), (0, 1));
+        assert!(pool.pick_heap(1, Some(0)).is_none(), "no tile of a trimmed heap is handed out");
+
+        // on, heap 1 with a tile still in use: it stays; heap 0 is the spare and goes
+        let mut pool = filled(true);
+        assert_eq!(pool.reclaim(1, Some(n), t1, P), Vec::<u32>::new());
+        assert_eq!(pool.reclaim(1, Some(n), t2 + n, P), vec![0]);
+        assert_eq!(pool.free_total, P as usize - 1);
+        assert!(pool.live[1]);
+
+        // off: the spare stays however long it is empty
+        let mut pool = filled(false);
+        assert_eq!(pool.reclaim(1, None, t1, P), vec![1]);
+        assert_eq!(pool.reclaim(1, None, t2 + n, P), Vec::<u32>::new());
+        assert_eq!((pool.free_total, pool.trimmed), (P as usize, 0));
+
+        // a heap used again in between starts its empty time over (both kept as spares)
+        let mut pool = filled(false);
+        assert_eq!(pool.reclaim(2, Some(n), t1, P), Vec::<u32>::new());
+        let mut none = || None;
+        let tiles = pool.take_batch(1, Some(0), t1 + n / 2, P, &mut none).unwrap();
+        assert_eq!(tiles, [(0, 0)]);
+        pool.return_tiles(&tiles);
+        assert_eq!(pool.reclaim(2, Some(n), t2, P), vec![1]);
+        assert_eq!(pool.reclaim(2, Some(n), t2 + n - Duration::from_millis(1), P), Vec::<u32>::new());
+        assert_eq!(pool.reclaim(2, Some(n), t2 + n, P), vec![0]);
+        assert_eq!(pool.trimmed, 2);
     }
 
     #[test]
